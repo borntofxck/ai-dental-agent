@@ -1,0 +1,27 @@
+{
+  "name": "ai-dental-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "agent:dev": "node agent-api/src/index.js",
+    "agent:start": "node agent-api/src/index.js",
+    "agent:test": "node scripts/test-agent-api.js",
+    "booking:test": "node scripts/test-booking-parser.js",
+    "clinic:seed": "node scripts/seed-clinic-data.js",
+    "db:generate": "prisma generate",
+    "db:push": "prisma db push",
+    "db:pull": "prisma db pull",
+    "db:studio": "prisma studio",
+    "db:test": "node scripts/test-prisma.js"
+  },
+  "dependencies": {
+    "@prisma/client": "6.19.3",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "groq-sdk": "^1.1.1"
+  },
+  "devDependencies": {
+    "prisma": "6.19.3"
+  }
+}

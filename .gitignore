@@ -1,0 +1,8 @@
+.env
+node_modules/
+*.log
+
+max-adapter/.auth/
+max-adapter/artifacts/
+max-adapter/playwright-report/
+max-adapter/test-results/
