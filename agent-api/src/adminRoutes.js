@@ -2,6 +2,13 @@ import express from "express";
 import { readFile, writeFile } from "node:fs/promises";
 import { prisma } from "./db.js";
 import { processIncomingMessage } from "./messageService.js";
+import {
+  getAnnualHygieneRecipients,
+  getBroadcastRecipients,
+  getOutboundQueue,
+  queueAnnualHygieneBroadcast,
+  queueBroadcast
+} from "./broadcastService.js";
 
 const systemPromptPath = new URL("../../prompts/dental_admin_system_prompt.md", import.meta.url);
 const clinicKnowledgePath = new URL("../../prompts/clinic_knowledge.md", import.meta.url);
@@ -22,7 +29,11 @@ const tableModels = {
   service_categories: prisma.serviceCategory,
   clinic_services: prisma.clinicService,
   follow_up_rules: prisma.followUpRule,
-  completed_visits: prisma.completedVisit
+  completed_visits: prisma.completedVisit,
+  broadcast_campaigns: prisma.broadcastCampaign,
+  outbound_message_queue: prisma.outboundMessageQueue,
+  max_chat_state: prisma.maxChatState,
+  max_message_queue: prisma.maxMessageQueue
 };
 
 function startOfToday() {
@@ -256,6 +267,45 @@ export function createAdminRouter() {
     });
 
     res.json({ reminders });
+  });
+
+  router.get("/broadcast/recipients", async (req, res) => {
+    const recipients = req.query.annual_hygiene === "true"
+      ? await getAnnualHygieneRecipients({ limit: req.query.limit })
+      : await getBroadcastRecipients({
+          serviceQuery: req.query.service_query,
+          visitedBeforeDays: req.query.visited_before_days,
+          visitedAfterDays: req.query.visited_after_days,
+          onlyWithVisits: req.query.only_with_visits === "true",
+          limit: req.query.limit
+        });
+
+    res.json({ recipients, count: recipients.length });
+  });
+
+  router.post("/broadcast", async (req, res) => {
+    const result = req.body?.annual_hygiene
+      ? await queueAnnualHygieneBroadcast({
+          prompt: req.body?.prompt,
+          limit: req.body?.limit,
+          useAi: Boolean(req.body?.use_ai)
+        })
+      : await queueBroadcast({
+          name: req.body?.name,
+          prompt: req.body?.prompt,
+          filters: req.body?.filters || {},
+          type: req.body?.type || "broadcast",
+          useAi: Boolean(req.body?.use_ai)
+        });
+
+    res.json({ ok: true, ...result });
+  });
+
+  router.get("/broadcast/outbound-queue", async (req, res) => {
+    res.json(await getOutboundQueue({
+      status: req.query.status,
+      limit: req.query.limit
+    }));
   });
 
   router.patch("/handoffs/:id/resolve", async (req, res) => {

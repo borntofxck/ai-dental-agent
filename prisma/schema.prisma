@@ -8,18 +8,19 @@ datasource db {
 }
 
 model Contact {
-  id              Int                   @id @default(autoincrement())
-  maxUserId       String                @unique @map("max_user_id") @db.VarChar(100)
-  displayName     String?               @map("display_name") @db.VarChar(255)
-  phone           String?               @db.VarChar(30)
-  createdAt       DateTime?             @default(now()) @map("created_at") @db.Timestamp(6)
-  updatedAt       DateTime?             @default(now()) @map("updated_at") @db.Timestamp(6)
-  appointments    AppointmentRequest[]
-  completedVisits CompletedVisit[]
-  conversations   Conversation[]
-  handoffs        Handoff[]
-  messages        Message[]
-  reminders       AppointmentReminder[]
+  id               Int                    @id @default(autoincrement())
+  maxUserId        String                 @unique @map("max_user_id") @db.VarChar(100)
+  displayName      String?                @map("display_name") @db.VarChar(255)
+  phone            String?                @db.VarChar(30)
+  createdAt        DateTime?              @default(now()) @map("created_at") @db.Timestamp(6)
+  updatedAt        DateTime?              @default(now()) @map("updated_at") @db.Timestamp(6)
+  appointments     AppointmentRequest[]
+  completedVisits  CompletedVisit[]
+  conversations    Conversation[]
+  handoffs         Handoff[]
+  messages         Message[]
+  reminders        AppointmentReminder[]
+  outboundMessages OutboundMessageQueue[]
 
   @@map("contacts")
 }
@@ -255,4 +256,92 @@ model CompletedVisit {
 
   @@index([visitDate])
   @@map("completed_visits")
+}
+
+model MaxMessageQueue {
+  id                Int       @id @default(autoincrement())
+  messageKey        String    @unique @map("message_key") @db.VarChar(80)
+  chatId            String    @map("chat_id") @db.VarChar(120)
+  chatName          String?   @map("chat_name") @db.VarChar(255)
+  messageText       String    @map("message_text")
+  externalMessageId String?   @map("external_message_id") @db.VarChar(120)
+  source            String?   @db.VarChar(100)
+  status            String    @default("queued") @db.VarChar(30)
+  attempts          Int       @default(0)
+  lockedUntil       DateTime? @map("locked_until") @db.Timestamp(6)
+  lastError         String?   @map("last_error")
+  n8nResponse       Json?     @map("n8n_response")
+  rawPayload        Json?     @map("raw_payload")
+  queuedAt          DateTime  @default(now()) @map("queued_at") @db.Timestamp(6)
+  processedAt       DateTime? @map("processed_at") @db.Timestamp(6)
+  sentAt            DateTime? @map("sent_at") @db.Timestamp(6)
+  updatedAt         DateTime  @default(now()) @map("updated_at") @db.Timestamp(6)
+
+  @@index([status, queuedAt])
+  @@index([chatId, queuedAt])
+  @@map("max_message_queue")
+}
+
+model BroadcastCampaign {
+  id              Int                    @id @default(autoincrement())
+  name            String?                @db.VarChar(255)
+  prompt          String
+  filters         Json?
+  type            String                 @default("broadcast") @db.VarChar(50)
+  status          String                 @default("queued") @db.VarChar(30)
+  recipientsCount Int                    @default(0) @map("recipients_count")
+  createdAt       DateTime               @default(now()) @map("created_at") @db.Timestamp(6)
+  startedAt       DateTime?              @map("started_at") @db.Timestamp(6)
+  completedAt     DateTime?              @map("completed_at") @db.Timestamp(6)
+  messages        OutboundMessageQueue[]
+
+  @@index([status, createdAt])
+  @@map("broadcast_campaigns")
+}
+
+model OutboundMessageQueue {
+  id            Int                @id @default(autoincrement())
+  campaignId    Int?               @map("campaign_id")
+  contactId     Int?               @map("contact_id")
+  chatId        String             @map("chat_id") @db.VarChar(120)
+  chatName      String?            @map("chat_name") @db.VarChar(255)
+  recipientName String?            @map("recipient_name") @db.VarChar(255)
+  type          String             @default("broadcast") @db.VarChar(50)
+  priority      Int                @default(50)
+  dedupeKey     String?            @unique @map("dedupe_key") @db.VarChar(180)
+  prompt        String?
+  messageText   String             @map("message_text")
+  status        String             @default("queued") @db.VarChar(30)
+  attempts      Int                @default(0)
+  scheduledAt   DateTime           @default(now()) @map("scheduled_at") @db.Timestamp(6)
+  lockedUntil   DateTime?          @map("locked_until") @db.Timestamp(6)
+  sentAt        DateTime?          @map("sent_at") @db.Timestamp(6)
+  lastError     String?            @map("last_error")
+  rawPayload    Json?              @map("raw_payload")
+  createdAt     DateTime           @default(now()) @map("created_at") @db.Timestamp(6)
+  updatedAt     DateTime           @default(now()) @map("updated_at") @db.Timestamp(6)
+  campaign      BroadcastCampaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull, onUpdate: NoAction)
+  contact       Contact?           @relation(fields: [contactId], references: [id], onDelete: SetNull, onUpdate: NoAction)
+
+  @@index([status, priority, scheduledAt])
+  @@index([chatId, scheduledAt])
+  @@index([contactId, type])
+  @@map("outbound_message_queue")
+}
+
+model MaxChatState {
+  id              Int       @id @default(autoincrement())
+  chatId          String    @unique @map("chat_id") @db.VarChar(120)
+  chatName        String?   @map("chat_name") @db.VarChar(255)
+  lastPreviewText String?   @map("last_preview_text")
+  lastPreviewTime String?   @map("last_preview_time") @db.VarChar(50)
+  lastDirection   String?   @map("last_direction") @db.VarChar(20)
+  lastInboundAt   DateTime? @map("last_inbound_at") @db.Timestamp(6)
+  lastOutboundAt  DateTime? @map("last_outbound_at") @db.Timestamp(6)
+  cooldownUntil   DateTime? @map("cooldown_until") @db.Timestamp(6)
+  updatedAt       DateTime  @default(now()) @map("updated_at") @db.Timestamp(6)
+
+  @@index([chatName])
+  @@index([cooldownUntil])
+  @@map("max_chat_state")
 }

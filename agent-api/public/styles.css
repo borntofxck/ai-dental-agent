@@ -184,8 +184,14 @@ body {
   max-height: calc(100vh - 185px);
 }
 
+.broadcast-table {
+  max-height: 360px;
+}
+
 .db-table-wrap td,
-.db-table-wrap th {
+.db-table-wrap th,
+.broadcast-table td,
+.broadcast-table th {
   white-space: nowrap;
   max-width: 420px;
   overflow: hidden;

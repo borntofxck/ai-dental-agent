@@ -10,6 +10,7 @@ const pageLoaders = {
   dashboard: loadDashboard,
   conversations: loadConversations,
   appointments: loadAppointments,
+  broadcast: loadBroadcast,
   prompts: loadPrompts,
   database: loadTables,
   test: async () => {}
@@ -275,6 +276,111 @@ async function loadAppointments() {
     : `<tr><td colspan="8" class="text-center text-secondary py-4">Заявок нет.</td></tr>`;
 }
 
+async function loadBroadcast() {
+  await Promise.all([
+    previewBroadcastRecipients(),
+    loadOutboundQueue()
+  ]);
+}
+
+function getBroadcastPayload() {
+  const mode = $("#broadcastMode").value;
+  const limit = Number($("#broadcastLimit").value || 100);
+  return {
+    mode,
+    annual_hygiene: mode === "annual_hygiene",
+    name: $("#broadcastName").value,
+    prompt: $("#broadcastPrompt").value,
+    limit,
+    use_ai: $("#broadcastUseAi").checked,
+    filters: {
+      serviceQuery: $("#broadcastServiceQuery").value,
+      visitedBeforeDays: Number($("#broadcastVisitedBefore").value || 0),
+      onlyWithVisits: true,
+      limit
+    }
+  };
+}
+
+async function previewBroadcastRecipients() {
+  const payload = getBroadcastPayload();
+  const params = new URLSearchParams({
+    limit: String(payload.limit)
+  });
+
+  if (payload.annual_hygiene) {
+    params.set("annual_hygiene", "true");
+  } else {
+    if (payload.filters.serviceQuery) params.set("service_query", payload.filters.serviceQuery);
+    if (payload.filters.visitedBeforeDays) params.set("visited_before_days", String(payload.filters.visitedBeforeDays));
+    params.set("only_with_visits", "true");
+  }
+
+  const { recipients, count } = await api(`/broadcast/recipients?${params.toString()}`);
+  $("#broadcastRecipientCount").textContent = `${count} получ.`;
+  $("#broadcastRecipientsTable").innerHTML = recipients.length
+    ? recipients.map((recipient) => `
+      <tr>
+        <td>
+          <strong>${escapeHtml(recipient.patient_name || recipient.display_name || "-")}</strong>
+          <div class="small-muted">${escapeHtml(recipient.phone || "")}</div>
+        </td>
+        <td>${escapeHtml(recipient.chat_id || "-")}</td>
+        <td>${escapeHtml(recipient.last_service || "-")}</td>
+        <td>${escapeHtml(recipient.last_visit_date || "-")}</td>
+      </tr>
+    `).join("")
+    : `<tr><td colspan="4" class="text-center text-secondary py-4">Получателей по фильтрам пока нет.</td></tr>`;
+}
+
+async function createBroadcast() {
+  const payload = getBroadcastPayload();
+  const body = payload.annual_hygiene
+    ? {
+        annual_hygiene: true,
+        prompt: payload.prompt,
+        limit: payload.limit,
+        use_ai: payload.use_ai
+      }
+    : {
+        name: payload.name,
+        prompt: payload.prompt,
+        filters: payload.filters,
+        type: "broadcast",
+        use_ai: payload.use_ai
+      };
+
+  const result = await api("/broadcast", {
+    method: "POST",
+    body: JSON.stringify(body)
+  });
+
+  toast(`Рассылка создана: ${result.queued} сообщений в очереди`);
+  await loadBroadcast();
+}
+
+async function loadOutboundQueue() {
+  const { items, stats } = await api("/broadcast/outbound-queue?limit=80");
+  const statsText = Object.entries(stats || {}).map(([key, value]) => `${key}: ${value}`).join(" · ");
+  if (statsText) $("#reloadOutboundQueueButton").textContent = `Обновить очередь (${statsText})`;
+
+  $("#outboundQueueTable").innerHTML = items.length
+    ? items.map((item) => `
+      <tr>
+        <td>#${item.id}</td>
+        <td>
+          <strong>${escapeHtml(item.recipientName || item.contact?.displayName || item.chatName || "-")}</strong>
+          <div class="small-muted">${escapeHtml(item.chatId)}</div>
+        </td>
+        <td>${escapeHtml(item.type)}</td>
+        <td>${badge(item.status)}</td>
+        <td title="${escapeHtml(item.messageText)}">${escapeHtml(shortText(item.messageText, 80))}</td>
+        <td>${formatDateTime(item.sentAt || item.scheduledAt || item.createdAt)}</td>
+      </tr>
+    `).join("")
+    : `<tr><td colspan="6" class="text-center text-secondary py-4">Очередь пуста.</td></tr>`;
+}
+
 async function saveAppointmentStatus(id) {
   const select = document.querySelector(`.appointment-status[data-appointment-id="${id}"]`);
   await api(`/appointments/${id}/status`, {
@@ -396,6 +502,10 @@ $("#conversationDetail").addEventListener("click", async (event) => {
 });
 
 $("#reloadAppointmentsButton").addEventListener("click", () => loadAppointments().catch(showError));
+$("#previewBroadcastButton").addEventListener("click", () => previewBroadcastRecipients().catch(showError));
+$("#createBroadcastButton").addEventListener("click", () => createBroadcast().catch(showError));
+$("#reloadOutboundQueueButton").addEventListener("click", () => loadOutboundQueue().catch(showError));
+$("#broadcastMode").addEventListener("change", () => previewBroadcastRecipients().catch(showError));
 
 $("#appointmentsTable").addEventListener("click", (event) => {
   const button = event.target.closest("[data-save-appointment-status]");

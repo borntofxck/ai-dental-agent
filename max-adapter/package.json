@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "node src/index.js",
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "db:generate": "prisma generate --schema ../prisma/schema.prisma"
   },
   "dependencies": {
     "dotenv": "^17.3.1",
