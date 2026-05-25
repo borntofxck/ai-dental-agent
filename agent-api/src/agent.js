@@ -34,9 +34,12 @@ const structuredOutputPrompt = `
 Правила JSON:
 - Если клиент спрашивает цену, intent = "price_question".
 - Если клиент хочет записаться, intent = "book_appointment".
+- Если клиент просто спрашивает про услуги, цены или условия, сначала ответь по вопросу. Не превращай любой вопрос в запись.
 - Если есть тревожные симптомы, should_handoff = true.
 - should_create_appointment_request = true только когда заявка достаточно собрана.
 - В memory_update записывай только факты из диалога, не выдумывай телефон, дату, врача или услугу.
+- Не повторяй полное имя клиента в каждом ответе. Если нужно обратиться, используй имя без фамилии.
+- Пиши естественно: 1-3 коротких предложения, без одинаковых шаблонов подряд.
 `;
 
 function toGroqHistory(messages) {
@@ -46,7 +49,7 @@ function toGroqHistory(messages) {
   }));
 }
 
-function fallbackResponse(userMessage) {
+function fallbackResponse(userMessage, memory = {}) {
   const riskyWords = [
     "отек",
     "опух",
@@ -59,6 +62,7 @@ function fallbackResponse(userMessage) {
   ];
   const lower = userMessage.toLowerCase();
   const risky = riskyWords.some((word) => lower.includes(word));
+  const name = memory?.patient_name ? `${String(memory.patient_name).split(/\s+/u)[0]}, ` : "";
 
   if (risky) {
     return {
@@ -72,14 +76,77 @@ function fallbackResponse(userMessage) {
     };
   }
 
+  if (/(услуг|что есть|какая услуга|по услуг|сервис)/iu.test(lower)) {
+    return {
+      reply: `${name}у нас есть терапия, гигиена, хирургия, ортопедия, имплантация, ортодонтия и детская стоматология. Могу сориентировать по цене или помочь записаться.`,
+      intent: "consultation",
+      urgency: "low",
+      should_create_appointment_request: false,
+      should_handoff: false,
+      handoff_reason: null,
+      memory_update: {}
+    };
+  }
+
+  if (/(гигиен|чистк|air\s*flow|аир\s*флоу)/iu.test(lower)) {
+    return {
+      reply: `${name}профгигиена стоит от 4500 рублей, Air Flow отдельно от 3000. Точнее скажет врач после осмотра. Хотите записаться на гигиену?`,
+      intent: "consultation",
+      urgency: "low",
+      should_create_appointment_request: false,
+      should_handoff: false,
+      handoff_reason: null,
+      memory_update: {
+        requested_service: "профессиональная гигиена",
+        complaint: "профессиональная гигиена"
+      }
+    };
+  }
+
+  if (/(цен|стоимост|сколько стоит|прайс)/iu.test(lower)) {
+    return {
+      reply: `${name}могу сориентировать по цене, но точная сумма зависит от осмотра и снимка. Напишите, какая услуга интересует: кариес, гигиена, удаление, коронка или что-то другое?`,
+      intent: "price_question",
+      urgency: "low",
+      should_create_appointment_request: false,
+      should_handoff: false,
+      handoff_reason: null,
+      memory_update: {}
+    };
+  }
+
+  if (/(минет|секс|нах|хуй|пизд|еба|ёба|бля)/iu.test(lower)) {
+    return {
+      reply: `${name}я по стоматологии. Могу подсказать по услугам, ценам или записать на прием.`,
+      intent: "other",
+      urgency: "low",
+      should_create_appointment_request: false,
+      should_handoff: false,
+      handoff_reason: null,
+      memory_update: {}
+    };
+  }
+
+  if (/^(привет|приветствую|здравствуйте|добрый день|добрый вечер|дратути|алло|ало)[!.?\s]*$/iu.test(lower.trim())) {
+    return {
+      reply: `${name || "Здравствуйте! "}Подскажу по услугам, ценам или помогу записаться. Что интересует?`.replace(/^([А-ЯЁа-яё-]+, )Подскажу/u, "$1подскажу"),
+      intent: "consultation",
+      urgency: "low",
+      should_create_appointment_request: false,
+      should_handoff: false,
+      handoff_reason: null,
+      memory_update: {}
+    };
+  }
+
   return {
-    reply: "Здравствуйте. Понимаю, лучше не тянуть. Напишите имя и когда удобно подойти на прием?",
-    intent: "book_appointment",
-    urgency: "normal",
+    reply: `${name}поняла. Напишите, что нужно: консультация по услуге, цена или запись на прием?`,
+    intent: "clarification",
+    urgency: "low",
     should_create_appointment_request: false,
     should_handoff: false,
     handoff_reason: null,
-    memory_update: { intent: "book_appointment", complaint: userMessage, urgency: "normal" }
+    memory_update: {}
   };
 }
 
@@ -279,6 +346,7 @@ function extractFactsFromMessage(userMessage) {
   const serviceMap = [
     ["кариес", "лечение кариеса"],
     ["пульпит", "лечение пульпита"],
+    ["лечение", "лечение зубов"],
     ["чистк", "профессиональная гигиена"],
     ["гигиен", "профессиональная гигиена"],
     ["удален", "удаление зуба"],
@@ -316,7 +384,7 @@ function normalizeName(name) {
 
 export async function generateAgentResponse({ userMessage, history, memory }) {
   if (!config.groqApiKey || config.groqApiKey === "your_groq_api_key_here") {
-    return fallbackResponse(userMessage);
+    return improveAgentResult(fallbackResponse(userMessage, memory), userMessage);
   }
 
   const groq = new Groq({ apiKey: config.groqApiKey });
@@ -325,35 +393,45 @@ export async function generateAgentResponse({ userMessage, history, memory }) {
   const dbClinicKnowledge = await getClinicKnowledgeContext();
   const currentDate = new Date().toISOString().slice(0, 10);
 
-  const response = await groq.chat.completions.create({
-    model: config.groqModel,
-    temperature: 0.55,
-    messages: [
-      {
-        role: "system",
-        content: [
-          systemPrompt,
-          clinicKnowledge ? `База знаний клиники:\n${clinicKnowledge}` : "",
-          dbClinicKnowledge ? `Актуальные справочники клиники из PostgreSQL:\n${dbClinicKnowledge}` : "",
-          structuredOutputPrompt,
-          `Клиника: ${config.clinicName}`,
-          config.clinicPhone ? `Телефон клиники: ${config.clinicPhone}` : "",
-          config.clinicAddress ? `Адрес клиники: ${config.clinicAddress}` : "",
-          `Текущая дата: ${currentDate}`,
-          `Текущая память диалога: ${JSON.stringify(memory || {})}`
-        ].filter(Boolean).join("\n\n")
-      },
-      ...toGroqHistory(history),
-      { role: "user", content: userMessage }
-    ]
-  });
+  let response;
+  try {
+    response = await groq.chat.completions.create({
+      model: config.groqModel,
+      temperature: 0.78,
+      max_tokens: config.groqMaxTokens,
+      messages: [
+        {
+          role: "system",
+          content: [
+            systemPrompt,
+            clinicKnowledge ? `База знаний клиники:\n${clinicKnowledge}` : "",
+            dbClinicKnowledge ? `Актуальные справочники клиники из PostgreSQL:\n${dbClinicKnowledge}` : "",
+            structuredOutputPrompt,
+            `Клиника: ${config.clinicName}`,
+            config.clinicPhone ? `Телефон клиники: ${config.clinicPhone}` : "",
+            config.clinicAddress ? `Адрес клиники: ${config.clinicAddress}` : "",
+            `Текущая дата: ${currentDate}`,
+            `Текущая память диалога: ${JSON.stringify(memory || {})}`
+          ].filter(Boolean).join("\n\n")
+        },
+        ...toGroqHistory(history),
+        { role: "user", content: userMessage }
+      ]
+    });
+  } catch (error) {
+    console.warn("Groq request failed, using local fallback:", error.message);
+    return improveAgentResult({
+      ...fallbackResponse(userMessage, memory),
+      model_error: error.message
+    }, userMessage);
+  }
 
   const text = response.choices?.[0]?.message?.content || "";
   const parsed = parseJsonObject(text);
 
   if (!parsed?.reply) {
     return improveAgentResult({
-      ...fallbackResponse(userMessage),
+      ...fallbackResponse(userMessage, memory),
       raw_model_response: text
     }, userMessage);
   }

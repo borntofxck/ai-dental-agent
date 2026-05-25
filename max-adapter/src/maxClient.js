@@ -222,14 +222,39 @@ export class MaxClient {
 
     const messages = await this.page.locator("main .history [role='listitem']").evaluateAll((nodes, max) => (
       nodes.slice(-max).map((node, index) => {
+        const cleanText = (value = "") => String(value)
+          .replace(/\u00a0/g, " ")
+          .replace(/\s+/g, " ")
+          .trim();
+        const clone = node.cloneNode(true);
+        clone.querySelectorAll([
+          "time",
+          ".time",
+          "[class*='time']",
+          "[aria-hidden='true']",
+          "button",
+          "svg"
+        ].join(",")).forEach((element) => element.remove());
+
         const bubble = node.querySelector("[data-bubbles-variant]");
+        const cleanBubble = clone.querySelector("[data-bubbles-variant]") || clone;
         const variant = bubble?.getAttribute("data-bubbles-variant") || null;
-        const text = node.textContent?.trim().replace(/\s+/g, " ") || "";
+        const rawText = cleanText(node.innerText || node.textContent || "");
+        let text = cleanText(cleanBubble.innerText || cleanBubble.textContent || "");
+
+        if (!text) {
+          text = cleanText(rawText.replace(/\s+\d{1,2}:\d{2}$/u, ""));
+        }
+
+        if (/^\d{1,2}:\d{2}$/u.test(text) && rawText === text) {
+          text = "";
+        }
 
         return {
           index,
           direction: variant,
-          text
+          text,
+          raw_text: rawText
         };
       })
     ), limit);
@@ -264,20 +289,54 @@ export class MaxClient {
 
     const input = this.page.locator(config.selectors.messageInput).first();
     await input.click();
-    await this.page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A").catch(() => {});
-    await this.page.keyboard.type(text, { delay: 5 });
+    await input.fill("").catch(async () => {
+      await this.page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A").catch(() => {});
+      await this.page.keyboard.press("Backspace").catch(() => {});
+    });
+    await input.fill(text).catch(async () => {
+      await this.page.keyboard.type(text, { delay: 5 });
+    });
 
     if (config.selectors.sendButton) {
-      await this.page.locator(config.selectors.sendButton).first().click();
+      const sendButton = this.page.locator(config.selectors.sendButton).first();
+      await sendButton.click({ timeout: 3000 }).catch(async () => {
+        await input.press("Enter");
+      });
     } else {
       await input.press("Enter");
     }
 
+    const verification = await this.verifyMessageWasSent(text);
+
     return {
       sent: true,
+      verified: verification.verified,
       chat_id: chatId || null,
       text
     };
+  }
+
+  async verifyMessageWasSent(text) {
+    const expected = normalizeComparableText(text);
+    const input = this.page.locator(config.selectors.messageInput).first();
+    let composerText = "";
+
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await this.page.waitForTimeout(150);
+      composerText = await input.evaluate((element) => (
+        element.value || element.innerText || element.textContent || ""
+      )).catch(() => "");
+
+      if (!normalizeComparableText(composerText)) {
+        return { verified: true, reason: "composer_cleared" };
+      }
+    }
+
+    if (normalizeComparableText(composerText).includes(expected)) {
+      throw new Error("MAX message was left in composer draft; send button probably did not submit it");
+    }
+
+    return { verified: false, reason: "composer_not_empty", composer_text: composerText };
   }
 
   async stop() {
@@ -286,4 +345,8 @@ export class MaxClient {
     this.page = null;
     this.startedAt = null;
   }
+}
+
+function normalizeComparableText(value = "") {
+  return String(value).replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
 }

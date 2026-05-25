@@ -7,6 +7,8 @@ import { config } from "./config.js";
 const app = express();
 const maxClient = new MaxClient();
 const processedMessageKeys = new Set();
+const failedMessageKeys = new Map();
+const failedMessageRetryAfterMs = 60_000;
 const watcher = {
   timer: null,
   running: false,
@@ -356,7 +358,13 @@ async function processActiveChat({
 } = {}) {
   const activeChat = await maxClient.getActiveChatInfo();
   const chatMessages = await maxClient.readActiveChatMessages(limit);
-  const latestIncoming = chatMessages.messages.at(-1);
+  const meaningfulMessages = chatMessages.messages
+    .map((message) => ({
+      ...message,
+      text: cleanMaxMessageText(message.text)
+    }))
+    .filter((message) => message.text);
+  const latestIncoming = meaningfulMessages.at(-1);
 
   if (!latestIncoming || latestIncoming.direction !== "incoming") {
     if (throwIfNoMessage) {
@@ -366,7 +374,7 @@ async function processActiveChat({
     return { ok: true, skipped: true, reason: "Latest MAX chat message is not incoming" };
   }
 
-  const cleanText = cleanMaxMessageText(latestIncoming.text);
+  const cleanText = latestIncoming.text;
   if (!cleanText) {
     if (throwIfNoMessage) {
       throw new Error("Latest incoming message is empty after cleanup");
@@ -388,6 +396,17 @@ async function processActiveChat({
     };
   }
 
+  const failedAt = failedMessageKeys.get(messageKey);
+  if (!force && failedAt && Date.now() - failedAt < failedMessageRetryAfterMs) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: "Message failed recently; waiting before retry",
+      chat_id: chatId,
+      message_text: cleanText
+    };
+  }
+
   const payload = {
     channel: "max",
     max_user_id: chatId,
@@ -402,7 +421,14 @@ async function processActiveChat({
     }
   };
 
-  const n8nResponse = await sendIncomingMessageToN8n(payload);
+  let n8nResponse;
+  try {
+    n8nResponse = await sendIncomingMessageToN8n(payload);
+    failedMessageKeys.delete(messageKey);
+  } catch (error) {
+    failedMessageKeys.set(messageKey, Date.now());
+    throw error;
+  }
 
   if (n8nResponse.reply) {
     await maxClient.sendMessage(chatId, n8nResponse.reply);

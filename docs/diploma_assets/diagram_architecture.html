@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: #f5f7fb;
+    font-family: "Segoe UI", Arial, sans-serif;
+    color: #111827;
+  }
+  .canvas {
+    width: 1280px;
+    min-height: 720px;
+    padding: 42px;
+    background: #f5f7fb;
+  }
+  h1 {
+    font-size: 30px;
+    margin: 0 0 26px;
+    line-height: 1.2;
+    color: #111827;
+  }
+  .muted { color: #475569; }
+  .row { display: flex; gap: 18px; align-items: stretch; }
+  .box {
+    background: #fff;
+    border: 1px solid #d8dee9;
+    border-radius: 12px;
+    padding: 20px;
+    box-shadow: 0 10px 28px rgba(15, 23, 42, .08);
+  }
+  .arrow {
+    font-size: 34px;
+    color: #2563eb;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+  }
+  .tag {
+    display: inline-block;
+    padding: 5px 10px;
+    border-radius: 999px;
+    background: #e0f2fe;
+    color: #075985;
+    font-size: 13px;
+    margin-bottom: 10px;
+    font-weight: 700;
+  }
+  .grid { display: grid; gap: 14px; }
+  .small { font-size: 15px; line-height: 1.45; }
+  .title { font-size: 20px; font-weight: 700; margin-bottom: 8px; }
+  .table {
+    display: grid;
+    grid-template-columns: 120px 1fr 1fr;
+    gap: 1px;
+    background: #cbd5e1;
+    border: 1px solid #cbd5e1;
+  }
+  .cell {
+    background: #fff;
+    padding: 14px;
+    font-size: 15px;
+    line-height: 1.35;
+  }
+  .head { background: #e2e8f0; font-weight: 700; }
+  .accent { border-left: 5px solid #2563eb; }
+  .green { border-left-color: #16a34a; }
+  .orange { border-left-color: #f97316; }
+  .red { border-left-color: #dc2626; }
+</style>
+</head>
+<body>
+  <div class="canvas">
+      <h1>Архитектура MVP AI-агента стоматологической клиники</h1>
+      <div class="row">
+        <div class="box accent" style="width:170px">
+          <div class="tag">Канал</div>
+          <div class="title">MAX</div>
+          <div class="small muted">Web-интерфейс пациента, входящие сообщения и ответы</div>
+        </div>
+        <div class="arrow">→</div>
+        <div class="box green" style="width:210px">
+          <div class="tag">Адаптер</div>
+          <div class="title">Node.js + Playwright</div>
+          <div class="small muted">Читает новые сообщения, открывает чаты, отправляет ответы</div>
+        </div>
+        <div class="arrow">→</div>
+        <div class="box orange" style="width:160px">
+          <div class="tag">Workflow</div>
+          <div class="title">n8n</div>
+          <div class="small muted">Webhook, маршрутизация, контроль шагов</div>
+        </div>
+        <div class="arrow">→</div>
+        <div class="box accent" style="width:210px">
+          <div class="tag">Логика</div>
+          <div class="title">Agent API</div>
+          <div class="small muted">Память диалога, AI-ответ, запись, напоминания</div>
+        </div>
+        <div class="arrow">→</div>
+        <div class="box red" style="width:170px">
+          <div class="tag">Данные</div>
+          <div class="title">PostgreSQL</div>
+          <div class="small muted">Контакты, переписки, заявки, слоты, врачи</div>
+        </div>
+      </div>
+      <div class="box" style="margin-top:32px">
+        <div class="title">Основная идея архитектуры</div>
+        <div class="small">
+          Браузерный адаптер работает с MAX, n8n управляет маршрутом обработки,
+          Agent API принимает решение и сохраняет результат в PostgreSQL. Такой подход подходит для MVP
+          и оставляет возможность дальнейшего развития.
+        </div>
+      </div>
+    </div>
+</body>
+</html>

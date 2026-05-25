@@ -1,4 +1,5 @@
 import { prisma } from "./db.js";
+import { buildClinicDateTime } from "./bookingParser.js";
 
 export async function getDueReminders(limit = 20) {
   const reminders = await prisma.appointmentReminder.findMany({
@@ -7,14 +8,32 @@ export async function getDueReminders(limit = 20) {
       remindAt: { lte: new Date() }
     },
     orderBy: { remindAt: "asc" },
-    take: limit,
+    take: limit * 3,
     include: {
       contact: true,
       appointmentRequest: true
     }
   });
 
-  return reminders.map((reminder) => ({
+  const freshReminders = [];
+  const now = new Date();
+
+  for (const reminder of reminders) {
+    const appointmentAt = buildClinicDateTime(
+      reminder.appointmentRequest.preferredDate,
+      reminder.appointmentRequest.preferredTime
+    );
+
+    if (appointmentAt && now >= appointmentAt) {
+      await markReminderExpired(reminder.id, "appointment_time_already_passed");
+      continue;
+    }
+
+    freshReminders.push(reminder);
+    if (freshReminders.length >= limit) break;
+  }
+
+  return freshReminders.map((reminder) => ({
     id: reminder.id,
     type: reminder.type,
     remind_at: reminder.remindAt,
@@ -51,6 +70,17 @@ export async function markReminderFailed(id, error) {
     data: {
       status: "failed",
       error: String(error || "unknown reminder delivery error").slice(0, 2000),
+      updatedAt: new Date()
+    }
+  });
+}
+
+export async function markReminderExpired(id, reason = "reminder_expired") {
+  return prisma.appointmentReminder.update({
+    where: { id: Number(id) },
+    data: {
+      status: "expired",
+      error: reason,
       updatedAt: new Date()
     }
   });

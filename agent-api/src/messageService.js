@@ -13,7 +13,7 @@ import {
 import { prisma } from "./db.js";
 
 function normalizeChannel(channel) {
-  return (channel || "MAX").toUpperCase();
+  return (cleanScalar(channel) || "MAX").toUpperCase();
 }
 
 function mergeMemory(currentMemory, ...updates) {
@@ -26,8 +26,38 @@ function mergeMemory(currentMemory, ...updates) {
 }
 
 function cleanIncomingText(value) {
-  const text = String(value || "").trim();
-  return text.startsWith("=") ? text.slice(1).trim() : text;
+  return cleanScalar(value);
+}
+
+function cleanScalar(value) {
+  if (value === null || value === undefined) return "";
+
+  let text = String(value).replace(/\u00a0/g, " ").trim();
+  while (text.startsWith("=")) {
+    text = text.slice(1).trim();
+  }
+
+  if (/^(null|undefined)$/iu.test(text)) return "";
+  return text;
+}
+
+function cleanOptional(value) {
+  return cleanScalar(value) || null;
+}
+
+function normalizeIncomingPayload(payload = {}) {
+  const messageText = cleanIncomingText(payload.message_text);
+  const maxUserId = cleanScalar(payload.max_user_id);
+  const channel = normalizeChannel(payload.channel);
+
+  return {
+    ...payload,
+    channel,
+    max_user_id: maxUserId,
+    display_name: cleanOptional(payload.display_name),
+    phone: cleanOptional(payload.phone),
+    message_text: messageText
+  };
 }
 
 async function findOrCreateConversation(contactId, channel) {
@@ -53,10 +83,11 @@ async function findOrCreateConversation(contactId, channel) {
 }
 
 export async function processIncomingMessage(input) {
-  const payload = input?.body && !input.message_text ? input.body : input;
-  const messageText = cleanIncomingText(payload.message_text);
-  const maxUserId = String(payload.max_user_id || "").trim();
-  const channel = normalizeChannel(payload.channel);
+  const rawPayload = input?.body && !input.message_text ? input.body : input;
+  const payload = normalizeIncomingPayload(rawPayload);
+  const messageText = payload.message_text;
+  const maxUserId = payload.max_user_id;
+  const channel = payload.channel;
 
   if (!messageText) {
     throw new Error("message_text is required");
@@ -118,30 +149,48 @@ export async function processIncomingMessage(input) {
     conversationId: conversation.id,
     contactId: contact.id
   });
+  const baseMemory = activeAppointment
+    ? memoryRow?.memory || {}
+    : clearStaleBookingMemory(memoryRow?.memory || {});
 
   const agentResult = await generateAgentResponse({
     userMessage: messageText,
-    history: recentMessages,
-    memory: memoryRow?.memory || {}
+    history: prepareHistoryForAgent(recentMessages, { activeAppointment }),
+    memory: baseMemory
   });
-
   const deterministicFacts = extractBookingFacts(messageText);
-  const nextMemory = normalizeBookingMemory(mergeMemory(
-    memoryRow?.memory,
-    agentResult.memory_update,
-    deterministicFacts
-  ));
   const currentMessageBookingSignal = isBookingIntent({
     text: messageText,
     memory: deterministicFacts
-  }) || hasActionableBookingFacts(deterministicFacts);
+  }) || hasSchedulingBookingFacts(deterministicFacts);
+  const safeMemoryUpdate = !activeAppointment && !currentMessageBookingSignal
+    ? clearStaleBookingMemory(sanitizeAgentMemoryUpdate(agentResult.memory_update, messageText))
+    : sanitizeAgentMemoryUpdate(agentResult.memory_update, messageText);
+  const safeAgentResult = {
+    ...agentResult,
+    memory_update: safeMemoryUpdate
+  };
+
+  const nextMemory = normalizeBookingMemory(mergeMemory(
+    baseMemory,
+    safeAgentResult.memory_update,
+    deterministicFacts
+  ));
   const hasBookingDraft = isDraftAppointmentStatus(activeAppointment?.status);
   const hasConfirmedBooking = activeAppointment?.status === "confirmed";
-  const bookingIntent = currentMessageBookingSignal || hasBookingDraft;
+  const bookingIntent = currentMessageBookingSignal || (
+    hasBookingDraft &&
+    shouldContinueBookingDraft({
+      messageText,
+      agentResult: safeAgentResult,
+      deterministicFacts
+    })
+  );
   const postBookingSocialReply = hasConfirmedBooking
     ? buildPostBookingSocialReply({ messageText, appointmentRequest: activeAppointment, memory: nextMemory })
     : null;
   const missingBookingFields = getMissingAppointmentFields({ memory: nextMemory, payload });
+  const responseMissingBookingFields = bookingIntent ? missingBookingFields : [];
   const shouldCreateAppointmentRequest = !agentResult.should_handoff &&
     bookingIntent &&
     missingBookingFields.length === 0;
@@ -162,15 +211,31 @@ export async function processIncomingMessage(input) {
   }
 
   let finalReply = agentResult.reply;
+  let replySource = "agent";
   if (postBookingSocialReply) {
     finalReply = postBookingSocialReply;
+    replySource = "post_booking_social";
   } else if (slotConflict) {
     finalReply = buildSlotConflictReply({ memory: nextMemory, slotConflict, messageText });
+    replySource = "slot_conflict";
   } else if (appointmentRequest && shouldCreateAppointmentRequest) {
     finalReply = buildBookingConfirmedReply({ appointmentRequest, memory: nextMemory, messageText });
-  } else if (bookingIntent) {
+    replySource = "booking_confirmed";
+  } else if (bookingIntent && shouldUseWorkflowProgressReply({
+    agentReply: agentResult.reply,
+    missingFields: missingBookingFields,
+    messageText
+  })) {
     finalReply = buildBookingProgressReply({ memory: nextMemory, payload, missingFields: missingBookingFields, messageText });
+    replySource = "booking_progress";
   }
+  finalReply = sanitizeStaleBookingReply({
+    reply: finalReply,
+    messageText,
+    memory: nextMemory,
+    activeAppointment,
+    bookingIntent
+  });
 
   const outgoingMessage = await prisma.message.create({
     data: {
@@ -181,11 +246,13 @@ export async function processIncomingMessage(input) {
       text: finalReply,
       rawPayload: {
         ...agentResult,
+        memory_update: safeAgentResult.memory_update,
         reply: finalReply,
         deterministic_facts: deterministicFacts,
         booking_intent: bookingIntent,
-        missing_booking_fields: missingBookingFields,
-        slot_conflict: slotConflict
+        missing_booking_fields: responseMissingBookingFields,
+        slot_conflict: slotConflict,
+        reply_source: replySource
       }
     }
   });
@@ -207,7 +274,7 @@ export async function processIncomingMessage(input) {
       conversationId: conversation.id,
       actionType: agentResult.should_handoff ? "handoff" : "answer",
       reason: agentResult.handoff_reason || agentResult.intent || null,
-      payload: agentResult
+      payload: safeAgentResult
     }
   });
 
@@ -229,7 +296,7 @@ export async function processIncomingMessage(input) {
     should_handoff: agentResult.should_handoff,
     should_create_appointment_request: shouldCreateAppointmentRequest && !slotConflict,
     slot_conflict: slotConflict,
-    missing_booking_fields: missingBookingFields,
+    missing_booking_fields: responseMissingBookingFields,
     contact_id: contact.id,
     conversation_id: conversation.id,
     incoming_message_id: incomingMessage.id,
@@ -250,14 +317,16 @@ async function upsertAppointmentRequest({ conversationId, contactId, payload, me
 
   try {
     const appointmentRequest = await prisma.$transaction(async (tx) => {
-      const existing = await tx.appointmentRequest.findFirst({
+      const existingCandidates = await tx.appointmentRequest.findMany({
         where: {
           conversationId,
           contactId,
           status: { in: ["new", "pending", "collecting", "waiting_confirmation", "confirmed"] }
         },
-        orderBy: { createdAt: "desc" }
+        orderBy: { createdAt: "desc" },
+        take: 10
       });
+      const reusableExisting = existingCandidates.find(isAppointmentStillRelevant) || null;
 
       const data = {
         patientName: memory.patient_name || payload.display_name || null,
@@ -273,9 +342,9 @@ async function upsertAppointmentRequest({ conversationId, contactId, payload, me
         updatedAt: new Date()
       };
 
-      const appointment = existing
+      const appointment = reusableExisting
         ? await tx.appointmentRequest.update({
-            where: { id: existing.id },
+            where: { id: reusableExisting.id },
             data
           })
         : await tx.appointmentRequest.create({
@@ -331,7 +400,7 @@ async function upsertAppointmentRequest({ conversationId, contactId, payload, me
 }
 
 async function findActiveAppointmentRequest({ conversationId, contactId }) {
-  return prisma.appointmentRequest.findFirst({
+  const appointments = await prisma.appointmentRequest.findMany({
     where: {
       conversationId,
       contactId,
@@ -339,10 +408,70 @@ async function findActiveAppointmentRequest({ conversationId, contactId }) {
     },
     orderBy: { createdAt: "desc" }
   });
+
+  return appointments.find(isAppointmentStillRelevant) || null;
 }
 
 function isDraftAppointmentStatus(status) {
   return ["new", "pending", "collecting", "waiting_confirmation"].includes(status);
+}
+
+function isAppointmentStillRelevant(appointment) {
+  if (!appointment) return false;
+  if (isDraftAppointmentStatus(appointment.status)) return true;
+  if (appointment.status !== "confirmed") return false;
+
+  const appointmentAt = buildParsedClinicDateTime(appointment.preferredDate, appointment.preferredTime);
+  if (!appointmentAt) return true;
+
+  return appointmentAt > new Date();
+}
+
+function clearStaleBookingMemory(memory = {}) {
+  const cleaned = { ...(memory || {}) };
+
+  delete cleaned.intent;
+  delete cleaned.preferred_date;
+  delete cleaned.preferred_time;
+  delete cleaned.consent_to_book;
+  delete cleaned.preferred_doctor;
+  delete cleaned.requested_service;
+  delete cleaned.urgency;
+  delete cleaned.complaint;
+
+  return cleaned;
+}
+
+function prepareHistoryForAgent(messages = [], { activeAppointment = null } = {}) {
+  const prepared = [];
+  let previousKey = "";
+
+  for (const message of messages) {
+    const text = cleanScalar(message.text);
+    if (!text) continue;
+
+    if (!activeAppointment && isStaleBookingHistoryMessage(message)) {
+      continue;
+    }
+
+    const key = `${message.role}:${text.toLowerCase()}`;
+    if (key === previousKey) continue;
+
+    prepared.push({ ...message, text });
+    previousKey = key;
+  }
+
+  return prepared.slice(-8);
+}
+
+function isStaleBookingHistoryMessage(message) {
+  const text = String(message.text || "").toLowerCase();
+  if (message.role === "assistant") {
+    return /(запис|ждем|ждём|напоминан|визит|при[её]м).{0,80}(\d{1,2}:\d{2}|\d{1,2}\.\d{1,2})/iu.test(text) ||
+      /(запись подтвержд|готово, записала|напоминание)/iu.test(text);
+  }
+
+  return false;
 }
 
 function hasActionableBookingFacts(facts = {}) {
@@ -350,6 +479,7 @@ function hasActionableBookingFacts(facts = {}) {
     facts.intent === "book_appointment" ||
     facts.patient_name ||
     facts.phone ||
+    facts.complaint ||
     facts.preferred_date ||
     facts.preferred_time ||
     facts.requested_service ||
@@ -358,10 +488,135 @@ function hasActionableBookingFacts(facts = {}) {
   );
 }
 
+function hasSchedulingBookingFacts(facts = {}) {
+  return Boolean(
+    facts.intent === "book_appointment" ||
+    facts.patient_name ||
+    facts.phone ||
+    facts.preferred_date ||
+    facts.preferred_time ||
+    facts.preferred_doctor ||
+    facts.consent_to_book === true
+  );
+}
+
+function sanitizeAgentMemoryUpdate(update = {}, messageText = "") {
+  const cleaned = { ...(update || {}) };
+  const lower = String(messageText || "").toLowerCase().trim();
+  const socialOrNoise = /^(спасибо|благодарю|хорошо|понял|поняла|ок|окей|да|нет|ага|угу|ладно|класс|супер)[.!?\s]*$/iu.test(lower) ||
+    /(лол|бот|робот|какашка|нах|хуй|пизд|еба|ёба|бля)/iu.test(lower);
+
+  if (socialOrNoise) {
+    delete cleaned.complaint;
+    delete cleaned.requested_service;
+    if (cleaned.intent && cleaned.intent !== "book_appointment") {
+      delete cleaned.intent;
+    }
+    return cleaned;
+  }
+
+  if (cleaned.complaint && !looksLikeDentalTopic(messageText) && cleanScalar(cleaned.complaint) === cleanScalar(messageText)) {
+    delete cleaned.complaint;
+  }
+
+  if (cleaned.requested_service && !looksLikeDentalTopic(messageText) && cleanScalar(cleaned.requested_service) === cleanScalar(messageText)) {
+    delete cleaned.requested_service;
+  }
+
+  return cleaned;
+}
+
+function looksLikeDentalTopic(text = "") {
+  return /(зуб|десн|бол|ноет|кариес|пломб|пульпит|периодонт|чистк|гигиен|удален|удалит|имплант|коронк|протез|брекет|элайнер|прикус|консультац|осмотр|лечение|лечить|стоматолог|врач)/iu.test(String(text || ""));
+}
+
+function shouldContinueBookingDraft({ messageText, agentResult = {}, deterministicFacts = {} }) {
+  const lower = String(messageText || "").toLowerCase();
+  const memoryUpdate = agentResult.memory_update || {};
+
+  if (/(какие|что есть|услуг|цен|стоимост|прайс|сколько стоит)/iu.test(lower)) {
+    return false;
+  }
+
+  if (/(спасибо|благодар|хорошо|понял|поняла|окей|^ок$|лол|бот|робот|нах|хуй|пизд|еба|ёба|бля)/iu.test(lower)) {
+    return false;
+  }
+
+  if (hasActionableBookingFacts(deterministicFacts)) return true;
+  if (hasActionableBookingFacts(memoryUpdate)) return true;
+  if (agentResult.intent === "book_appointment") return true;
+
+  return false;
+}
+
+function shouldUseWorkflowProgressReply({ agentReply = "", missingFields = [], messageText = "" }) {
+  const reply = String(agentReply || "").trim().toLowerCase();
+  if (!reply) return true;
+
+  const lowerMessage = String(messageText || "").toLowerCase();
+  if (/(какие|что есть|услуг|цен|стоимост|прайс|сколько стоит)/iu.test(lowerMessage)) {
+    return false;
+  }
+
+  const genericPatterns = [
+    /чем могу помочь/u,
+    /что беспокоит или на какую услугу/u,
+    /подскажите, что беспокоит/u,
+    /напишите услугу, дату/u
+  ];
+
+  if (genericPatterns.some((pattern) => pattern.test(reply))) {
+    return true;
+  }
+
+  if (missingFields.includes("consent_to_book")) {
+    return !/(фиксир|запис|подтверд|оформ|передать заявку|подходит|соглас)/iu.test(reply);
+  }
+
+  if (missingFields.includes("preferred_date") && !/(день|дат|когда|сегодня|завтра)/iu.test(reply)) {
+    return true;
+  }
+
+  if (missingFields.includes("preferred_time") && !/(время|когда|во сколько|час)/iu.test(reply)) {
+    return true;
+  }
+
+  return false;
+}
+
+function sanitizeStaleBookingReply({ reply = "", messageText = "", memory = {}, activeAppointment = null, bookingIntent = false }) {
+  if (activeAppointment || bookingIntent) return reply;
+
+  const text = String(reply || "").trim();
+  const lowerReply = text.toLowerCase();
+  const lowerMessage = String(messageText || "").toLowerCase().trim();
+  const mentionsOldVisit = /(ждем|ждём|напоминан|подтвержден|подтверждена|запись подтвержд)/iu.test(lowerReply) ||
+    /(\d{1,2}:\d{2}|\d{1,2}\.\d{1,2}(?:\.20\d{2})?)/u.test(lowerReply);
+  if (!mentionsOldVisit) return reply;
+
+  const name = shortName(memory.patient_name || "");
+
+  if (/^(привет|здравствуйте|добрый день|добрый вечер|дратути)[!.?\s]*$/iu.test(lowerMessage)) {
+    return name ? `Привет, ${name}. Чем могу помочь?` : "Здравствуйте! Чем могу помочь?";
+  }
+
+  if (/^(спасибо|благодарю|хорошо|ок|окей|понял|поняла)[!.?\s]*$/iu.test(lowerMessage)) {
+    return "Пожалуйста.";
+  }
+
+  if (/(бот|робот|повтор|одно и то же|нах|хуй|пизд|еба|ёба|бля)/iu.test(lowerMessage)) {
+    return "Поняла, повторяться не буду. Напишите, что нужно уточнить по услугам или записи.";
+  }
+
+  return name
+    ? `${name}, уточните, пожалуйста, что сейчас нужно: услуги, цена или новая запись?`
+    : "Уточните, пожалуйста, что сейчас нужно: услуги, цена или новая запись?";
+}
+
 function buildPostBookingSocialReply({ messageText, appointmentRequest, memory }) {
   const lower = String(messageText || "").toLowerCase();
   const casual = isCasualMessage(messageText);
-  const name = memory.patient_name || appointmentRequest.patientName || "";
+  const name = shortName(memory.patient_name || appointmentRequest.patientName || "");
   const prefix = name ? `${name}, ` : "";
   const date = appointmentRequest.preferredDate ? formatBookingDateForReply(appointmentRequest.preferredDate) : null;
   const time = appointmentRequest.preferredTime || null;
@@ -396,7 +651,7 @@ function buildPostBookingSocialReply({ messageText, appointmentRequest, memory }
 
 function buildSlotConflictReply({ memory, slotConflict, messageText }) {
   const casual = isCasualMessage(messageText);
-  const name = memory.patient_name ? `${memory.patient_name}, ` : "";
+  const name = memory.patient_name ? `${shortName(memory.patient_name)}, ` : "";
   const date = formatReplyDate(formatBookingDateForReply(slotConflict.preferred_date), casual);
   return casual
     ? `${name}на ${date} в ${slotConflict.preferred_time} уже занято. Киньте другой день или время, проверю.`
@@ -405,12 +660,12 @@ function buildSlotConflictReply({ memory, slotConflict, messageText }) {
 
 function buildBookingConfirmedReply({ appointmentRequest, memory, messageText }) {
   const casual = isCasualMessage(messageText);
-  const name = memory.patient_name || appointmentRequest.patientName;
+  const name = shortName(memory.patient_name || appointmentRequest.patientName);
   const service = memory.requested_service || appointmentRequest.requestedService;
   const date = formatBookingDateForReply(memory.preferred_date || appointmentRequest.preferredDate);
   const time = normalizeAppointmentTime(memory.preferred_time || appointmentRequest.preferredTime);
   const prefix = name ? `${name}, ` : "";
-  const visitText = service ? `на ${service}` : "на прием";
+  const visitText = formatVisitText(service);
   const slot = `${formatReplyDate(date, casual)} в ${time}`;
 
   return casual
@@ -420,9 +675,9 @@ function buildBookingConfirmedReply({ appointmentRequest, memory, messageText })
 
 function buildBookingProgressReply({ memory, payload, missingFields, messageText }) {
   const casual = isCasualMessage(messageText);
-  const name = memory.patient_name || payload.display_name;
+  const name = shortName(memory.patient_name || payload.display_name);
   const prefix = name ? `${name}, ` : "";
-  const service = memory.requested_service || "прием";
+  const service = formatProgressService(memory.requested_service || memory.complaint || "прием");
   const date = memory.preferred_date ? formatBookingDateForReply(memory.preferred_date) : null;
   const time = normalizeAppointmentTime(memory.preferred_time);
 
@@ -458,6 +713,32 @@ function buildBookingProgressReply({ memory, payload, missingFields, messageText
   return casual
     ? `${prefix}напишите услугу, дату и удобное время.`
     : `${prefix}уточните детали записи: услугу, дату и удобное время.`;
+}
+
+function shortName(value = "") {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  return text.split(/\s+/u)[0];
+}
+
+function formatVisitText(service = "") {
+  const normalized = String(service || "").trim().toLowerCase();
+  if (!normalized || /^(лечение|лечение зубов|прием|приём)$/iu.test(normalized)) {
+    return "на прием";
+  }
+
+  if (/при[её]м/u.test(normalized)) {
+    return `на ${service}`;
+  }
+
+  return `на ${service}`;
+}
+
+function formatProgressService(service = "") {
+  const normalized = String(service || "").trim();
+  if (!normalized) return "прием";
+  if (/^(лечение|лечение зубов)$/iu.test(normalized)) return "прием к стоматологу";
+  return normalized;
 }
 
 function isCasualMessage(text = "") {
