@@ -1,0 +1,233 @@
+[
+  {
+    "name": "ordinary_booking",
+    "userMessage": "Здравствуйте, хочу записаться на гигиену завтра в 15:00",
+    "raw": {
+      "reply": "Конечно. Подскажите, пожалуйста, как вас зовут?",
+      "intent": "booking",
+      "action": "collect_name",
+      "urgency": "low",
+      "should_handoff": false,
+      "handoff_reason": null,
+      "memory_patch": {
+        "name": null,
+        "phone": null,
+        "service": "гигиена",
+        "complaint": null,
+        "preferred_date": null,
+        "preferred_time": "15:00",
+        "status": null
+      }
+    }
+  },
+  {
+    "name": "pricing",
+    "userMessage": "Сколько стоит проф гигиена?",
+    "raw": {
+      "reply": "Профгигиена обычно считается от выбранной процедуры и состояния зубов. Могу подсказать ориентир по прайсу или помочь записаться на осмотр.",
+      "intent": "pricing",
+      "action": "none",
+      "urgency": "low",
+      "should_handoff": false,
+      "handoff_reason": null,
+      "memory_patch": {
+        "name": null,
+        "phone": null,
+        "service": "профессиональная гигиена",
+        "complaint": null,
+        "preferred_date": null,
+        "preferred_time": null,
+        "status": null
+      }
+    }
+  },
+  {
+    "name": "tooth_pain",
+    "userMessage": "Болит зуб при накусывании",
+    "raw": {
+      "reply": "Понимаю, с такой болью лучше не затягивать. Подскажите, на какой день вам удобно записаться?",
+      "intent": "booking",
+      "action": "collect_datetime",
+      "urgency": "medium",
+      "should_handoff": false,
+      "handoff_reason": null,
+      "memory_patch": {
+        "name": null,
+        "phone": null,
+        "service": null,
+        "complaint": "болит зуб при накусывании",
+        "preferred_date": null,
+        "preferred_time": null,
+        "status": null
+      }
+    }
+  },
+  {
+    "name": "urgent_case",
+    "userMessage": "После удаления сильный отек и температура",
+    "raw": {
+      "reply": "При отеке и температуре после удаления лучше срочно связаться с клиникой или обратиться за неотложной помощью. Я могу передать обращение администратору.",
+      "intent": "handoff",
+      "action": "handoff_to_admin",
+      "urgency": "high",
+      "should_handoff": true,
+      "handoff_reason": "urgent_symptoms",
+      "memory_patch": {
+        "name": null,
+        "phone": null,
+        "service": null,
+        "complaint": "после удаления сильный отек и температура",
+        "preferred_date": null,
+        "preferred_time": null,
+        "status": null
+      }
+    }
+  },
+  {
+    "name": "reschedule",
+    "userMessage": "Можно перенести запись на завтра?",
+    "raw": {
+      "reply": "Да, подскажите удобное время на завтра, и я помогу с переносом.",
+      "intent": "reschedule",
+      "action": "reschedule_appointment",
+      "urgency": "low",
+      "should_handoff": false,
+      "handoff_reason": null,
+      "memory_patch": {
+        "name": null,
+        "phone": null,
+        "service": null,
+        "complaint": null,
+        "preferred_date": null,
+        "preferred_time": null,
+        "status": "reschedule_requested"
+      }
+    }
+  },
+  {
+    "name": "cancel",
+    "userMessage": "Отмените запись",
+    "raw": {
+      "reply": "Поняла. Подскажите, пожалуйста, на какое имя была запись?",
+      "intent": "cancel",
+      "action": "cancel_appointment",
+      "urgency": "low",
+      "should_handoff": false,
+      "handoff_reason": null,
+      "memory_patch": {
+        "name": null,
+        "phone": null,
+        "service": null,
+        "complaint": null,
+        "preferred_date": null,
+        "preferred_time": null,
+        "status": "cancel_requested"
+      }
+    }
+  },
+  {
+    "name": "abuse",
+    "userMessage": "ало блять",
+    "raw": {
+      "reply": "Понимаю, сообщение эмоциональное. Если вопрос по клинике или записи, напишите его чуть подробнее.",
+      "intent": "abuse",
+      "action": "none",
+      "urgency": "low",
+      "should_handoff": false,
+      "handoff_reason": null,
+      "memory_patch": {
+        "name": null,
+        "phone": null,
+        "service": null,
+        "complaint": null,
+        "preferred_date": null,
+        "preferred_time": null,
+        "status": null
+      }
+    }
+  },
+  {
+    "name": "sexual_provocation",
+    "userMessage": "минетик",
+    "raw": {
+      "reply": "Не поддерживаю такие темы. Если нужен вопрос по стоматологии или записи, напишите его чуть подробнее.",
+      "intent": "abuse",
+      "action": "none",
+      "urgency": "low",
+      "should_handoff": false,
+      "handoff_reason": null,
+      "memory_patch": {
+        "name": null,
+        "phone": null,
+        "service": null,
+        "complaint": null,
+        "preferred_date": null,
+        "preferred_time": null,
+        "status": null
+      }
+    }
+  },
+  {
+    "name": "noise",
+    "userMessage": "?????",
+    "raw": {
+      "reply": "Что уточнить?",
+      "intent": "unknown",
+      "action": "none",
+      "urgency": "low",
+      "should_handoff": false,
+      "handoff_reason": null,
+      "memory_patch": {
+        "name": null,
+        "phone": null,
+        "service": null,
+        "complaint": null,
+        "preferred_date": null,
+        "preferred_time": null,
+        "status": null
+      }
+    }
+  },
+  {
+    "name": "json_reply_blocked",
+    "userMessage": "Привет",
+    "raw": {
+      "reply": "{\"reply\":\"Здравствуйте\",\"intent\":\"unknown\",\"action\":\"none\"}",
+      "intent": "unknown",
+      "action": "none",
+      "urgency": "low",
+      "should_handoff": false,
+      "handoff_reason": null,
+      "memory_patch": {
+        "name": null,
+        "phone": null,
+        "service": null,
+        "complaint": null,
+        "preferred_date": null,
+        "preferred_time": null,
+        "status": null
+      }
+    }
+  },
+  {
+    "name": "service_text_blocked",
+    "userMessage": "Привет",
+    "raw": {
+      "reply": "Проверяю данные: intent=booking action=collect_name memory_patch={}",
+      "intent": "booking",
+      "action": "collect_name",
+      "urgency": "low",
+      "should_handoff": false,
+      "handoff_reason": null,
+      "memory_patch": {
+        "name": null,
+        "phone": null,
+        "service": null,
+        "complaint": null,
+        "preferred_date": null,
+        "preferred_time": null,
+        "status": null
+      }
+    }
+  }
+]

@@ -44,18 +44,31 @@ model Conversation {
 }
 
 model Message {
-  id             Int          @id @default(autoincrement())
-  conversationId Int          @map("conversation_id")
-  contactId      Int          @map("contact_id")
-  direction      String       @db.VarChar(20)
-  role           String       @db.VarChar(30)
-  text           String
-  rawPayload     Json?        @map("raw_payload")
-  createdAt      DateTime?    @default(now()) @map("created_at") @db.Timestamp(6)
-  contact        Contact      @relation(fields: [contactId], references: [id], onDelete: Cascade, onUpdate: NoAction)
-  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  id                Int          @id @default(autoincrement())
+  conversationId    Int          @map("conversation_id")
+  contactId         Int          @map("contact_id")
+  direction         String       @db.VarChar(20)
+  role              String       @db.VarChar(30)
+  text              String
+  externalMessageId String?      @unique @map("external_message_id") @db.VarChar(160)
+  rawPayload        Json?        @map("raw_payload")
+  createdAt         DateTime?    @default(now()) @map("created_at") @db.Timestamp(6)
+  contact           Contact      @relation(fields: [contactId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  conversation      Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@map("messages")
+}
+
+model ConversationProcessingLock {
+  id          Int      @id @default(autoincrement())
+  lockKey     String   @unique @map("lock_key") @db.VarChar(180)
+  lockToken   String   @map("lock_token") @db.VarChar(80)
+  lockedUntil DateTime @map("locked_until") @db.Timestamp(6)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamp(6)
+  updatedAt   DateTime @default(now()) @map("updated_at") @db.Timestamp(6)
+
+  @@index([lockedUntil])
+  @@map("conversation_processing_locks")
 }
 
 model ConversationMemory {

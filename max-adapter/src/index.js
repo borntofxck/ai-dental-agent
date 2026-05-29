@@ -10,6 +10,26 @@ const maxClient = new MaxClient();
 const processedMessageKeys = new Set();
 const failedMessageKeys = new Map();
 const failedMessageRetryAfterMs = 2 * 60 * 1000;
+const SAFE_REPLY_FALLBACK = "Подскажите, пожалуйста, что вас интересует: услуга, цена или запись на прием?";
+const internalReplyPatterns = [
+  /проверяю\s+данные/iu,
+  /зафиксировал[аи]?/iu,
+  /сохраняю/iu,
+  /передаю\s+в\s+систем/iu,
+  /\bmemory\b/iu,
+  /\bmemory_patch\b/iu,
+  /\bmemory_update\b/iu,
+  /\bintent\b/iu,
+  /\baction\b/iu,
+  /\bhandoff\b/iu,
+  /\btool\b/iu,
+  /\bjson\b/iu,
+  /\bsystem\b/iu,
+  /\bassistant\b/iu,
+  /\breasoning\b/iu,
+  /\bstatus\b/iu,
+  /```/
+];
 const watcher = {
   scannerTimer: null,
   workerTimer: null,
@@ -536,7 +556,11 @@ async function processActiveChat({
   }
 
   const chatId = getActiveChatId(await maxClient.status(), activeChat);
-  const messageKey = makeMessageKey(chatId, cleanText);
+  const messageKey = makeMessageKey(chatId, cleanText, {
+    chatName: activeChat.name || activeChat.title || sourceChat?.name || "",
+    rawText: latestIncoming.raw_text || latestIncoming.text || "",
+    previewTime: sourceChat?.time || ""
+  });
 
   if (!force && processedMessageKeys.has(messageKey)) {
     return {
@@ -582,8 +606,9 @@ async function processActiveChat({
     throw error;
   }
 
-  if (n8nResponse.reply) {
-    await maxClient.sendMessage(chatId, n8nResponse.reply);
+  const reply = cleanReplyForMessenger(n8nResponse);
+  if (reply) {
+    await maxClient.sendMessage(chatId, reply);
   }
 
   processedMessageKeys.add(messageKey);
@@ -592,7 +617,7 @@ async function processActiveChat({
     ok: true,
     sent_to_n8n: payload,
     n8n_response: n8nResponse,
-    max_reply_sent: Boolean(n8nResponse.reply)
+    max_reply_sent: Boolean(reply)
   };
 }
 
@@ -631,7 +656,11 @@ async function enqueueActiveChatMessage({
   }
 
   const chatId = getActiveChatId(await maxClient.status(), activeChat);
-  const messageKey = makeMessageKey(chatId, cleanText);
+  const messageKey = makeMessageKey(chatId, cleanText, {
+    chatName: activeChat.name || activeChat.title || sourceChat?.name || "",
+    rawText: latestIncoming.raw_text || latestIncoming.text || "",
+    previewTime: sourceChat?.time || ""
+  });
   const externalMessageId = messageKey;
   const rawPayload = {
     source,
@@ -717,14 +746,15 @@ async function processQueuedMessage() {
 
   try {
     const n8nResponse = await sendIncomingMessageToN8n(payload);
-    if (n8nResponse.reply) {
+    const reply = cleanReplyForMessenger(n8nResponse);
+    if (reply) {
       await maxClient.openChatByChatId(item.chatId);
-      await maxClient.sendMessage(item.chatId, n8nResponse.reply);
+      await maxClient.sendMessage(item.chatId, reply);
       await updateMaxChatState({
         chatId: item.chatId,
         chatName: item.chatName || "MAX User",
         direction: "outgoing",
-        previewText: n8nResponse.reply
+        previewText: reply
       }).catch(() => {});
     }
 
@@ -734,7 +764,7 @@ async function processQueuedMessage() {
         status: "sent",
         n8nResponse,
         processedAt: new Date(),
-        sentAt: n8nResponse.reply ? new Date() : null,
+        sentAt: reply ? new Date() : null,
         lockedUntil: null,
         lastError: null,
         updatedAt: new Date()
@@ -745,7 +775,7 @@ async function processQueuedMessage() {
       ok: true,
       queue_id: item.id,
       chat_id: item.chatId,
-      reply_sent: Boolean(n8nResponse.reply),
+      reply_sent: Boolean(reply),
       queue: await getQueueStats()
     };
   } catch (error) {
@@ -1170,14 +1200,49 @@ function normalizeComparable(value = "") {
   return String(value || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim().toLowerCase();
 }
 
+function cleanReplyForMessenger(response) {
+  if (!response || typeof response.reply !== "string") return "";
+
+  const reply = response.reply
+    .replace(/```(?:json)?/giu, "")
+    .replace(/```/gu, "")
+    .replace(/^\s*(?:reply|ответ)\s*[:=-]\s*/iu, "")
+    .replace(/\s+/gu, " ")
+    .trim();
+
+  if (!reply) return "";
+  if (looksLikeInternalReply(reply)) return SAFE_REPLY_FALLBACK;
+  return reply;
+}
+
+function looksLikeInternalReply(text = "") {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return true;
+  if ((trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
+    return true;
+  }
+  if (/"reply"\s*:|"intent"\s*:|"action"\s*:|"memory_patch"\s*:/iu.test(trimmed)) {
+    return true;
+  }
+  return internalReplyPatterns.some((pattern) => pattern.test(trimmed));
+}
+
 function getActiveChatId(status, activeChat) {
   const urlPart = status.url?.match(/\/(\d+)(?:\D*$|$)/)?.[1];
   const namePart = activeChat.name || activeChat.title || "unknown";
   return urlPart ? `max_chat_${urlPart}` : `max_chat_${slugify(namePart)}`;
 }
 
-function makeMessageKey(chatId, text) {
-  return crypto.createHash("sha256").update(`${chatId}:${text}`).digest("hex").slice(0, 32);
+function makeMessageKey(chatId, text, meta = {}) {
+  const fingerprint = [
+    chatId,
+    meta.chatName || "",
+    text,
+    meta.rawText || "",
+    meta.previewTime || ""
+  ].join(":");
+
+  return crypto.createHash("sha256").update(fingerprint).digest("hex").slice(0, 32);
 }
 
 function slugify(value) {

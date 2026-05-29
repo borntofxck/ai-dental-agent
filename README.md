@@ -109,6 +109,71 @@ curl -X POST http://localhost:3002/incoming-message \
 The endpoint saves contact, conversation, incoming message, outgoing message, memory and agent action through Prisma.
 When enough booking data is collected, it also creates or updates an `appointment_requests` row, reserves an `appointment_slots` row, and creates pending `appointment_reminders`.
 
+Production reply safety:
+
+```text
+The LLM is asked for strict structured output: reply, intent, action, should_handoff, urgency and memory_patch.
+Only reply is allowed to leave Agent API and be sent to MAX.
+Sanitizers block JSON, reasoning, action/memory/status/tool text and other internal artifacts before sending.
+Sanitizers do not decide dialogue from the user's text. Rude/noisy/complaint messages are handled by the state/action guard layer first.
+Duplicate protection uses external_message_id, per-conversation locks, recent reply debounce and repeated incoming text checks.
+```
+
+Appointment confirmation gate:
+
+```text
+Questions about doctors, prices, consultation cost or "when can I come" are treated as information requests.
+The backend does not create appointments from model output alone.
+create_appointment is allowed only after explicit user confirmation plus required booking data: reason/service, date, time and patient contact details.
+If the gate is not passed, appointment_requests, appointment_slots and appointment_reminders are not created.
+If the model proposes create_appointment too early, code downgrades the action, logs the event and asks for the missing detail instead.
+Fallback responses are emergency-only: LLM failure, invalid JSON, empty answer or unsafe reply.
+```
+
+State/action guards:
+
+```text
+Conversation state is tracked in memory: idle, answering_question, collecting_booking_data,
+waiting_booking_confirmation, appointment_booked, cancellation_requested, reschedule_requested,
+handoff_required.
+Cancel intent has priority over booking and reschedule. Messages like "отменить", "удалите",
+"не надо", "денег нет", "зачем вы меня записали" clear pending booking data, cancel pending
+reminders and block create_appointment. Angry wrong-booking complaints create a handoff.
+Dental service disambiguation runs before cancel validation: "удалить зуб", "удалить зуб мудрости",
+"вырвать зуб" and similar phrases are treated as tooth_extraction / wisdom_tooth_extraction,
+not as appointment cancellation. Only explicit references to запись, прием, визит or бронь can
+trigger cancel_appointment.
+```
+
+Safe reply pipeline:
+
+```text
+Business code builds a safe scripted reply for guarded states such as cancellation, reschedule,
+booking progress, booking confirmation, abuse/complaint and noisy messages.
+The AI humanizer may only paraphrase that safe reply. It cannot change action, add slots,
+prices or booking promises. The final text still passes through sanitizer before MAX sees it.
+If humanizer fails or changes meaning, Agent API sends the original safe scripted reply.
+Repeated emergency/noise fallback text is varied when the previous outgoing reply was the same.
+```
+
+Reminder daytime window:
+
+```text
+Agent replies to incoming user messages at any time.
+Scheduled reminders/reactivation messages are sent only inside REMINDER_SEND_WINDOW_START..REMINDER_SEND_WINDOW_END
+in REMINDER_TIMEZONE. Defaults: 09:00..21:00 Europe/Moscow.
+Due reminders outside that window are delayed to the next allowed daytime slot.
+Cancelled and needs_admin_review appointments block pending reminders.
+```
+
+Safety eval:
+
+```bash
+npm run agent:safety-test
+npm run agent:pipeline-test
+npm run agent:state-test
+```
+
 Slot protection:
 
 ```text

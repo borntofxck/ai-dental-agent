@@ -1,4 +1,5 @@
-import { generateAgentResponse } from "./agent.js";
+import { generateAgentResponse, humanizeReplyWithAI } from "./agent.js";
+import crypto from "node:crypto";
 import {
   buildClinicDateTime as buildParsedClinicDateTime,
   extractBookingFacts,
@@ -11,6 +12,22 @@ import {
   toIsoDate as toBookingIsoDate
 } from "./bookingParser.js";
 import { prisma } from "./db.js";
+import { sanitizeReplyForUser } from "./replySanitizer.js";
+
+const RESPONSE_DEBOUNCE_MS = 8000;
+const DUPLICATE_TEXT_WINDOW_MS = 10 * 60 * 1000;
+const LOCK_TTL_MS = 30 * 1000;
+
+const CONVERSATION_STATES = new Set([
+  "idle",
+  "answering_question",
+  "collecting_booking_data",
+  "waiting_booking_confirmation",
+  "appointment_booked",
+  "cancellation_requested",
+  "reschedule_requested",
+  "handoff_required"
+]);
 
 function normalizeChannel(channel) {
   return (cleanScalar(channel) || "MAX").toUpperCase();
@@ -56,6 +73,8 @@ function normalizeIncomingPayload(payload = {}) {
     max_user_id: maxUserId,
     display_name: cleanOptional(payload.display_name),
     phone: cleanOptional(payload.phone),
+    message_direction: cleanOptional(payload.message_direction || payload.direction),
+    external_message_id: cleanOptional(payload.external_message_id || payload.externalMessageId),
     message_text: messageText
   };
 }
@@ -82,6 +101,115 @@ async function findOrCreateConversation(contactId, channel) {
   });
 }
 
+async function acquireProcessingLock(lockKey) {
+  const now = new Date();
+  const lockedUntil = new Date(now.getTime() + LOCK_TTL_MS);
+  const lockToken = crypto.randomUUID();
+
+  try {
+    await prisma.conversationProcessingLock.create({
+      data: {
+        lockKey,
+        lockToken,
+        lockedUntil
+      }
+    });
+    return { acquired: true, lockToken };
+  } catch (error) {
+    if (error.code !== "P2002") {
+      throw error;
+    }
+
+    const updated = await prisma.conversationProcessingLock.updateMany({
+      where: {
+        lockKey,
+        lockedUntil: { lt: now }
+      },
+      data: {
+        lockToken,
+        lockedUntil,
+        updatedAt: now
+      }
+    });
+
+    return { acquired: updated.count > 0, lockToken };
+  }
+}
+
+async function releaseProcessingLock(lockKey, lockToken) {
+  await prisma.conversationProcessingLock.deleteMany({
+    where: {
+      lockKey,
+      lockToken
+    }
+  }).catch(() => {});
+}
+
+function buildSkippedResponse({ reason, contact, conversation, incomingMessage = null, externalMessageId = null }) {
+  return {
+    reply: null,
+    skipped: true,
+    reason,
+    contact_id: contact.id,
+    conversation_id: conversation.id,
+    incoming_message_id: incomingMessage?.id || null,
+    external_message_id: externalMessageId || null
+  };
+}
+
+function normalizeComparableMessage(value = "") {
+  return String(value || "")
+    .replace(/\u00a0/g, " ")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .toLowerCase();
+}
+
+export function avoidRepeatedBotReply(reply = "", recentMessages = []) {
+  const text = String(reply || "").trim();
+  if (!text) return text;
+
+  const lastOutgoing = [...recentMessages]
+    .reverse()
+    .find((message) => message.direction === "outgoing" || message.role === "assistant");
+
+  if (!lastOutgoing || normalizeComparableMessage(lastOutgoing.text) !== normalizeComparableMessage(text)) {
+    return text;
+  }
+
+  const alternatives = getReplyAlternatives(text);
+  return alternatives.find((candidate) => normalizeComparableMessage(candidate) !== normalizeComparableMessage(text)) || text;
+}
+
+function getReplyAlternatives(reply = "") {
+  const lower = String(reply || "").toLowerCase();
+
+  if (/не\s+совсем\s+понял|не\s+совсем\s+поняла|не\s+разобрала|не\s+уловила|сообщение\s+пришло\s+не\s+полностью/iu.test(lower)) {
+    return [
+      "Напишите чуть подробнее, пожалуйста. Я помогу с лечением, ценой или записью.",
+      "Не разобрала вопрос. Уточните, пожалуйста, что нужно: лечение, стоимость или запись.",
+      "Похоже, я не поняла сообщение. Сформулируйте чуть подробнее, и я отвечу.",
+      "Если вопрос по стоматологии или записи, напишите его чуть подробнее."
+    ];
+  }
+
+  if (/передам\s+администратор|автоматические\s+действия\s+останов/iu.test(lower)) {
+    return [
+      "Поняла вас. Автоматические действия остановлю и передам администратору на проверку.",
+      "Хорошо, не буду продолжать автоматический сценарий. Передам администратору, чтобы всё проверили.",
+      "Приняла. Остановлю авто-действия и передам ситуацию администратору."
+    ];
+  }
+
+  return [reply];
+}
+
+function isOutgoingPayload(payload = {}) {
+  const direction = cleanScalar(payload.message_direction || payload.direction).toLowerCase();
+  const role = cleanScalar(payload.role).toLowerCase();
+  return direction === "outgoing" || direction === "assistant" || role === "assistant";
+}
+
 export async function processIncomingMessage(input) {
   const rawPayload = input?.body && !input.message_text ? input.body : input;
   const payload = normalizeIncomingPayload(rawPayload);
@@ -96,6 +224,30 @@ export async function processIncomingMessage(input) {
   if (!maxUserId) {
     throw new Error("max_user_id is required");
   }
+
+  if (isOutgoingPayload(payload)) {
+    return {
+      reply: null,
+      skipped: true,
+      reason: "outgoing_message_ignored",
+      max_user_id: maxUserId,
+      channel
+    };
+  }
+
+  const lockKey = `conversation:${channel}:${maxUserId}`;
+  const lock = await acquireProcessingLock(lockKey);
+  if (!lock.acquired) {
+    return {
+      reply: null,
+      skipped: true,
+      reason: "conversation_locked",
+      max_user_id: maxUserId,
+      channel
+    };
+  }
+
+  try {
 
   const contact = await prisma.contact.upsert({
     where: { maxUserId },
@@ -112,6 +264,44 @@ export async function processIncomingMessage(input) {
   });
 
   const conversation = await findOrCreateConversation(contact.id, channel);
+  const externalMessageId = payload.external_message_id;
+
+  if (externalMessageId) {
+    const existingExternalMessage = await prisma.message.findUnique({
+      where: { externalMessageId }
+    });
+
+    if (existingExternalMessage) {
+      return buildSkippedResponse({
+        reason: "duplicate_external_message_id",
+        contact,
+        conversation,
+        externalMessageId
+      });
+    }
+  }
+
+  const lastIncomingMessage = await prisma.message.findFirst({
+    where: {
+      conversationId: conversation.id,
+      direction: "incoming"
+    },
+    orderBy: { createdAt: "desc" }
+  });
+
+  if (
+    lastIncomingMessage &&
+    normalizeComparableMessage(lastIncomingMessage.text) === normalizeComparableMessage(messageText) &&
+    lastIncomingMessage.createdAt &&
+    Date.now() - new Date(lastIncomingMessage.createdAt).getTime() < DUPLICATE_TEXT_WINDOW_MS
+  ) {
+    return buildSkippedResponse({
+      reason: "duplicate_latest_incoming_text",
+      contact,
+      conversation,
+      externalMessageId
+    });
+  }
 
   const incomingMessage = await prisma.message.create({
     data: {
@@ -120,6 +310,7 @@ export async function processIncomingMessage(input) {
       direction: "incoming",
       role: "user",
       text: messageText,
+      externalMessageId,
       rawPayload: payload
     }
   });
@@ -149,9 +340,86 @@ export async function processIncomingMessage(input) {
     conversationId: conversation.id,
     contactId: contact.id
   });
-  const baseMemory = activeAppointment
+  let baseMemory = activeAppointment
     ? memoryRow?.memory || {}
     : clearStaleBookingMemory(memoryRow?.memory || {});
+  const conversationIntent = detectConversationIntent(messageText);
+
+  if (
+    !activeAppointment &&
+    baseMemory.status === "cancellation_requested" &&
+    conversationIntent.intent === "message" &&
+    hasExplicitBookingRequest(messageText)
+  ) {
+    baseMemory = { ...clearAppointmentDraft(baseMemory), status: "collecting_booking_data" };
+  }
+
+  if (conversationIntent.intent === "cancel") {
+    return await handleGuardedScriptedTurn({
+      contact,
+      conversation,
+      incomingMessage,
+      externalMessageId,
+      payload,
+      messageText,
+      baseMemory,
+      activeAppointment,
+      guard: conversationIntent
+    });
+  }
+
+  if (conversationIntent.intent === "reschedule") {
+    return await handleGuardedScriptedTurn({
+      contact,
+      conversation,
+      incomingMessage,
+      externalMessageId,
+      payload,
+      messageText,
+      baseMemory,
+      activeAppointment,
+      guard: conversationIntent
+    });
+  }
+
+  if (conversationIntent.intent === "abuse" || conversationIntent.intent === "noise") {
+    return await handleGuardedScriptedTurn({
+      contact,
+      conversation,
+      incomingMessage,
+      externalMessageId,
+      payload,
+      messageText,
+      baseMemory,
+      activeAppointment,
+      guard: conversationIntent
+    });
+  }
+
+  if (isGreetingOnly(messageText) && shouldUseContextualGreeting({ recentMessages, activeAppointment, memory: baseMemory })) {
+    const afterReminder = activeAppointment
+      ? await hasRecentSentReminder(activeAppointment.id)
+      : false;
+
+    return await handleGuardedScriptedTurn({
+      contact,
+      conversation,
+      incomingMessage,
+      externalMessageId,
+      payload,
+      messageText,
+      baseMemory,
+      activeAppointment,
+      guard: {
+        intent: "greeting",
+        action: "answer_question",
+        state: afterReminder ? "appointment_booked" : "idle",
+        shouldHandoff: false,
+        events: [{ type: "contextual_first_reply", reason: afterReminder ? "after_reminder" : "greeting_only" }],
+        afterReminder
+      }
+    });
+  }
 
   const agentResult = await generateAgentResponse({
     userMessage: messageText,
@@ -159,10 +427,14 @@ export async function processIncomingMessage(input) {
     memory: baseMemory
   });
   const deterministicFacts = extractBookingFacts(messageText);
-  const currentMessageBookingSignal = isBookingIntent({
+  const explicitBookingConfirmation = hasExplicitBookingConfirmation(messageText);
+  if (explicitBookingConfirmation) {
+    deterministicFacts.consent_to_book = true;
+  }
+  const currentMessageBookingSignal = hasExplicitBookingRequest(messageText) || isBookingIntent({
     text: messageText,
     memory: deterministicFacts
-  }) || hasSchedulingBookingFacts(deterministicFacts);
+  });
   const safeMemoryUpdate = !activeAppointment && !currentMessageBookingSignal
     ? clearStaleBookingMemory(sanitizeAgentMemoryUpdate(agentResult.memory_update, messageText))
     : sanitizeAgentMemoryUpdate(agentResult.memory_update, messageText);
@@ -186,47 +458,132 @@ export async function processIncomingMessage(input) {
       deterministicFacts
     })
   );
+  const conversationState = resolveConversationState({
+    memory: baseMemory,
+    activeAppointment,
+    bookingIntent,
+    informationQuestion: isInformationQuestion(messageText)
+  });
   const postBookingSocialReply = hasConfirmedBooking
     ? buildPostBookingSocialReply({ messageText, appointmentRequest: activeAppointment, memory: nextMemory })
     : null;
   const missingBookingFields = getMissingAppointmentFields({ memory: nextMemory, payload });
-  const responseMissingBookingFields = bookingIntent ? missingBookingFields : [];
-  const shouldCreateAppointmentRequest = !agentResult.should_handoff &&
-    bookingIntent &&
-    missingBookingFields.length === 0;
+  const appointmentValidation = validateAppointmentCreation(safeAgentResult, nextMemory, {
+    payload,
+    messageText,
+    bookingIntent,
+    missingFields: missingBookingFields,
+    conversationState
+  });
+  const responseMissingBookingFields = bookingIntent ? appointmentValidation.missing_fields : [];
+  const shouldCreateAppointmentRequest = appointmentValidation.allowed;
   let appointmentRequest = null;
   let slotConflict = null;
+  const pipelineEvents = [
+    ...(Array.isArray(agentResult.pipeline_events) ? agentResult.pipeline_events : [])
+  ];
 
-  if (!agentResult.should_handoff && bookingIntent) {
+  if (bookingIntent && !appointmentValidation.allowed) {
+    pipelineEvents.push({
+      type: "create_appointment_blocked",
+      reason: appointmentValidation.reason,
+      missing_fields: appointmentValidation.missing_fields,
+      downgraded_action: appointmentValidation.downgraded_action
+    });
+
+    if (appointmentValidation.missing_fields.length > 0) {
+      pipelineEvents.push({
+        type: "missing_required_booking_fields",
+        reason: appointmentValidation.reason,
+        missing_fields: appointmentValidation.missing_fields
+      });
+    }
+  }
+
+  if ((agentResult.action === "create_appointment" || agentResult.should_create_appointment_request) && !appointmentValidation.allowed) {
+    pipelineEvents.push({
+      type: "action_downgraded",
+      from: "create_appointment",
+      to: appointmentValidation.downgraded_action,
+      reason: appointmentValidation.reason
+    });
+    pipelineEvents.push({
+      type: "unsafe_action_downgraded",
+      from: "create_appointment",
+      to: appointmentValidation.downgraded_action,
+      reason: appointmentValidation.reason
+    });
+    pipelineEvents.push({
+      type: "accidental_booking_attempt",
+      reason: appointmentValidation.reason,
+      missing_fields: appointmentValidation.missing_fields
+    });
+    safeAgentResult.action = appointmentValidation.downgraded_action;
+    safeAgentResult.should_create_appointment_request = false;
+  }
+
+  if (conversationIntent.intent === "booking_request" && isUnsafeDentalServiceAction(safeAgentResult)) {
+    pipelineEvents.push({
+      type: "unsafe_action_downgraded",
+      from: safeAgentResult.action || safeAgentResult.intent,
+      to: appointmentValidation.downgraded_action || "collect_datetime",
+      reason: "dental_service_not_cancel"
+    });
+    safeAgentResult.intent = "booking";
+    safeAgentResult.action = appointmentValidation.downgraded_action || "collect_datetime";
+    safeAgentResult.should_handoff = false;
+    safeAgentResult.handoff_reason = null;
+  }
+
+  if (!agentResult.should_handoff && shouldCreateAppointmentRequest) {
     const bookingResult = await upsertAppointmentRequest({
       conversationId: conversation.id,
       contactId: contact.id,
       payload,
       memory: nextMemory,
       confirm: shouldCreateAppointmentRequest,
-      missingFields: missingBookingFields
+      missingFields: appointmentValidation.missing_fields
     });
     appointmentRequest = bookingResult.appointmentRequest;
     slotConflict = bookingResult.slotConflict;
   }
+  nextMemory.status = resolveNextConversationState({
+    currentState: conversationState,
+    bookingIntent,
+    appointmentValidation,
+    appointmentRequest,
+    slotConflict,
+    activeAppointment,
+    informationQuestion: isInformationQuestion(messageText),
+    agentResult
+  });
 
   let finalReply = agentResult.reply;
   let replySource = "agent";
   if (postBookingSocialReply) {
     finalReply = postBookingSocialReply;
     replySource = "post_booking_social";
+  } else if (conversationIntent.intent === "pricing_question") {
+    finalReply = buildDentalServiceInfoReply({ service: conversationIntent.service, serviceCategory: conversationIntent.service_category, messageText });
+    replySource = "dental_service_info";
   } else if (slotConflict) {
     finalReply = buildSlotConflictReply({ memory: nextMemory, slotConflict, messageText });
     replySource = "slot_conflict";
   } else if (appointmentRequest && shouldCreateAppointmentRequest) {
     finalReply = buildBookingConfirmedReply({ appointmentRequest, memory: nextMemory, messageText });
     replySource = "booking_confirmed";
+  } else if (conversationIntent.intent === "booking_request" && bookingIntent && !appointmentValidation.allowed) {
+    finalReply = buildBookingProgressReply({ memory: nextMemory, payload, missingFields: appointmentValidation.missing_fields, messageText });
+    replySource = "booking_progress";
+  } else if (conversationIntent.intent === "booking_request" && isUnsafeDentalServiceReply(agentResult.reply)) {
+    finalReply = buildBookingProgressReply({ memory: nextMemory, payload, missingFields: appointmentValidation.missing_fields, messageText });
+    replySource = "booking_progress";
   } else if (bookingIntent && shouldUseWorkflowProgressReply({
     agentReply: agentResult.reply,
-    missingFields: missingBookingFields,
+    missingFields: appointmentValidation.missing_fields,
     messageText
   })) {
-    finalReply = buildBookingProgressReply({ memory: nextMemory, payload, missingFields: missingBookingFields, messageText });
+    finalReply = buildBookingProgressReply({ memory: nextMemory, payload, missingFields: appointmentValidation.missing_fields, messageText });
     replySource = "booking_progress";
   }
   finalReply = sanitizeStaleBookingReply({
@@ -236,6 +593,41 @@ export async function processIncomingMessage(input) {
     activeAppointment,
     bookingIntent
   });
+  finalReply = softenInformationQuestionReply(finalReply, { messageText, bookingIntent });
+  if (shouldHumanizeReplySource(replySource)) {
+    const humanized = await humanizeReplyWithAI({
+      safeReply: finalReply,
+      userMessage: messageText,
+      action: appointmentValidation.allowed ? "create_appointment" : appointmentValidation.downgraded_action,
+      state: nextMemory.status
+    });
+    pipelineEvents.push(...humanized.events);
+    finalReply = humanized.reply || finalReply;
+  }
+  finalReply = sanitizeReplyForUser(finalReply, { userMessage: messageText });
+  finalReply = avoidRepeatedBotReply(finalReply, recentMessages);
+
+  const recentOutgoingMessage = await prisma.message.findFirst({
+    where: {
+      conversationId: conversation.id,
+      direction: "outgoing",
+      createdAt: { gte: new Date(Date.now() - RESPONSE_DEBOUNCE_MS) }
+    },
+    orderBy: { createdAt: "desc" }
+  });
+
+  if (
+    recentOutgoingMessage &&
+    normalizeComparableMessage(recentOutgoingMessage.text) === normalizeComparableMessage(finalReply)
+  ) {
+    return buildSkippedResponse({
+      reason: "duplicate_recent_outgoing_reply",
+      contact,
+      conversation,
+      incomingMessage,
+      externalMessageId
+    });
+  }
 
   const outgoingMessage = await prisma.message.create({
     data: {
@@ -249,6 +641,8 @@ export async function processIncomingMessage(input) {
         memory_update: safeAgentResult.memory_update,
         reply: finalReply,
         deterministic_facts: deterministicFacts,
+        appointment_validation: appointmentValidation,
+        pipeline_events: pipelineEvents,
         booking_intent: bookingIntent,
         missing_booking_fields: responseMissingBookingFields,
         slot_conflict: slotConflict,
@@ -272,11 +666,17 @@ export async function processIncomingMessage(input) {
   await prisma.agentAction.create({
     data: {
       conversationId: conversation.id,
-      actionType: agentResult.should_handoff ? "handoff" : "answer",
+      actionType: safeAgentResult.action || (agentResult.should_handoff ? "handoff" : "answer"),
       reason: agentResult.handoff_reason || agentResult.intent || null,
-      payload: safeAgentResult
+      payload: {
+        ...safeAgentResult,
+        appointment_validation: appointmentValidation,
+        pipeline_events: pipelineEvents
+      }
     }
   });
+
+  await logPipelineEvents({ conversationId: conversation.id, events: pipelineEvents });
 
   if (agentResult.should_handoff) {
     await prisma.handoff.create({
@@ -303,6 +703,241 @@ export async function processIncomingMessage(input) {
     outgoing_message_id: outgoingMessage.id,
     appointment_request_id: appointmentRequest?.id || null,
     memory: nextMemory
+  };
+  } finally {
+    await releaseProcessingLock(lockKey, lock.lockToken);
+  }
+}
+
+async function handleGuardedScriptedTurn({
+  contact,
+  conversation,
+  incomingMessage,
+  externalMessageId,
+  payload,
+  messageText,
+  baseMemory,
+  activeAppointment,
+  guard
+}) {
+  const pipelineEvents = [...(guard.events || [])];
+  let nextMemory = { ...(baseMemory || {}) };
+  let actionType = guard.action || "answer_question";
+  let shouldHandoff = Boolean(guard.shouldHandoff);
+  let handoffReason = guard.reason || null;
+
+  if (guard.intent === "cancel") {
+    const clearResult = await clearPendingBooking({
+      conversationId: conversation.id,
+      contactId: contact.id,
+      activeAppointment,
+      needsAdminReview: guard.angry
+    });
+    pipelineEvents.push(...clearResult.events);
+    nextMemory = {
+      ...clearAppointmentDraft(nextMemory),
+      status: guard.angry ? "handoff_required" : "cancellation_requested"
+    };
+    actionType = guard.angry ? "handoff_to_admin" : (clearResult.touchedAppointments > 0 ? "cancel_appointment" : "none");
+    shouldHandoff = guard.angry || /зачем|почему|не просил|мы еще ничего не обговорили/iu.test(messageText);
+    handoffReason = shouldHandoff ? "cancel_or_wrong_booking_complaint" : "cancel_intent_detected";
+  } else if (guard.intent === "reschedule") {
+    nextMemory = {
+      ...nextMemory,
+      status: "reschedule_requested"
+    };
+    actionType = activeAppointment ? "reschedule_appointment" : "collect_datetime";
+  } else if (guard.intent === "greeting") {
+    nextMemory.status = guard.state || "idle";
+  } else if (guard.intent === "abuse") {
+    nextMemory = {
+      ...clearAppointmentDraft(nextMemory),
+      status: "handoff_required"
+    };
+    actionType = "handoff_to_admin";
+    shouldHandoff = true;
+    handoffReason = guard.reason || "abuse_or_complaint";
+  } else if (guard.intent === "noise") {
+    actionType = "none";
+    pipelineEvents.push({ type: "noise_ignored_without_state_change", previous_status: nextMemory.status || null });
+  }
+
+  const safeReply = buildSafeScriptedReply({
+    intent: guard.intent,
+    action: actionType,
+    state: nextMemory.status,
+    memory: nextMemory,
+    payload,
+    messageText,
+    activeAppointment,
+    afterReminder: guard.afterReminder,
+    shouldHandoff
+  });
+  const humanized = await humanizeReplyWithAI({
+    safeReply,
+    userMessage: messageText,
+    action: actionType,
+    state: nextMemory.status
+  });
+  pipelineEvents.push(...humanized.events);
+  const finalReply = avoidRepeatedBotReply(
+    sanitizeReplyForUser(humanized.reply || safeReply, { userMessage: messageText }),
+    await prisma.message.findMany({
+      where: {
+        conversationId: conversation.id,
+        id: { not: incomingMessage.id }
+      },
+      orderBy: { createdAt: "desc" },
+      take: 8
+    })
+  );
+
+  const recentOutgoingMessage = await prisma.message.findFirst({
+    where: {
+      conversationId: conversation.id,
+      direction: "outgoing",
+      createdAt: { gte: new Date(Date.now() - RESPONSE_DEBOUNCE_MS) }
+    },
+    orderBy: { createdAt: "desc" }
+  });
+
+  if (
+    recentOutgoingMessage &&
+    normalizeComparableMessage(recentOutgoingMessage.text) === normalizeComparableMessage(finalReply)
+  ) {
+    return buildSkippedResponse({
+      reason: "duplicate_recent_outgoing_reply",
+      contact,
+      conversation,
+      incomingMessage,
+      externalMessageId
+    });
+  }
+
+  const outgoingMessage = await prisma.message.create({
+    data: {
+      conversationId: conversation.id,
+      contactId: contact.id,
+      direction: "outgoing",
+      role: "assistant",
+      text: finalReply,
+      rawPayload: {
+        reply: finalReply,
+        safe_reply: safeReply,
+        guard,
+        action: actionType,
+        state: nextMemory.status,
+        pipeline_events: pipelineEvents,
+        reply_source: `${guard.intent}_guard`
+      }
+    }
+  });
+
+  await prisma.conversationMemory.upsert({
+    where: { conversationId: conversation.id },
+    update: {
+      memory: nextMemory,
+      updatedAt: new Date()
+    },
+    create: {
+      conversationId: conversation.id,
+      memory: nextMemory
+    }
+  });
+
+  await prisma.agentAction.create({
+    data: {
+      conversationId: conversation.id,
+      actionType,
+      reason: handoffReason || guard.reason || guard.intent,
+      payload: {
+        guard,
+        state: nextMemory.status,
+        safe_reply: safeReply,
+        reply: finalReply,
+        pipeline_events: pipelineEvents
+      }
+    }
+  });
+
+  await logPipelineEvents({ conversationId: conversation.id, events: pipelineEvents });
+
+  if (shouldHandoff) {
+    await prisma.handoff.create({
+      data: {
+        conversationId: conversation.id,
+        contactId: contact.id,
+        reason: handoffReason || "guard_requested_handoff",
+        status: "open"
+      }
+    });
+  }
+
+  return {
+    reply: finalReply,
+    intent: guard.intent,
+    action: actionType,
+    urgency: guard.angry ? "medium" : "low",
+    should_handoff: shouldHandoff,
+    should_create_appointment_request: false,
+    slot_conflict: null,
+    missing_booking_fields: [],
+    contact_id: contact.id,
+    conversation_id: conversation.id,
+    incoming_message_id: incomingMessage.id,
+    outgoing_message_id: outgoingMessage.id,
+    appointment_request_id: null,
+    memory: nextMemory
+  };
+}
+
+async function clearPendingBooking({ conversationId, contactId, activeAppointment = null, needsAdminReview = false }) {
+  const targetStatus = needsAdminReview ? "needs_admin_review" : "cancelled";
+  const appointments = await prisma.appointmentRequest.findMany({
+    where: {
+      conversationId,
+      contactId,
+      status: { in: ["new", "pending", "collecting", "waiting_confirmation", "confirmed"] }
+    },
+    select: { id: true, status: true }
+  });
+
+  const appointmentIds = appointments.map((appointment) => appointment.id);
+  if (activeAppointment?.id && !appointmentIds.includes(activeAppointment.id)) {
+    appointmentIds.push(activeAppointment.id);
+  }
+
+  if (appointmentIds.length > 0) {
+    await prisma.appointmentRequest.updateMany({
+      where: { id: { in: appointmentIds } },
+      data: {
+        status: targetStatus,
+        updatedAt: new Date()
+      }
+    });
+
+    await prisma.appointmentReminder.updateMany({
+      where: {
+        appointmentRequestId: { in: appointmentIds },
+        status: "pending"
+      },
+      data: {
+        status: "cancelled",
+        error: needsAdminReview ? "appointment_needs_admin_review" : "appointment_cancelled",
+        updatedAt: new Date()
+      }
+    });
+  }
+
+  const events = [
+    { type: "cancel_intent_detected", reason: needsAdminReview ? "complaint_or_aggression" : "user_cancelled" },
+    { type: "pending_booking_cleared", appointment_ids: appointmentIds },
+    ...(needsAdminReview ? [{ type: "appointment_needs_admin_review", appointment_ids: appointmentIds }] : [])
+  ];
+
+  return {
+    touchedAppointments: appointmentIds.length,
+    events
   };
 }
 
@@ -500,6 +1135,488 @@ function hasSchedulingBookingFacts(facts = {}) {
   );
 }
 
+export function detectConversationIntent(text = "") {
+  const lower = String(text || "").toLowerCase();
+  const dentalService = detectDentalServiceIntent(lower);
+  const explicitCancel = detectExplicitAppointmentCancel(lower);
+  const ambiguousDelete = detectAmbiguousDeleteIntent(lower, dentalService, explicitCancel);
+  const angry = isAngryOrComplaint(lower);
+
+  if (ambiguousDelete.detected) {
+    return {
+      intent: "abuse",
+      action: "handoff_to_admin",
+      state: "handoff_required",
+      shouldHandoff: true,
+      angry: true,
+      reason: "ambiguous_delete_intent",
+      service: dentalService.service,
+      service_category: dentalService.service_category,
+      events: [
+        { type: "dental_service_detected", service: dentalService.service, service_category: dentalService.service_category },
+        { type: "ambiguous_delete_intent", reason: ambiguousDelete.reason },
+        { type: "unsafe_action_downgraded", from: "cancel_or_booking", to: "handoff_to_admin", reason: "ambiguous_delete_intent" }
+      ]
+    };
+  }
+
+  if (explicitCancel.detected) {
+    return {
+      intent: "cancel",
+      action: angry ? "handoff_to_admin" : "cancel_appointment",
+      state: angry ? "handoff_required" : "cancellation_requested",
+      shouldHandoff: angry || /(зачем\s+вы\s+меня\s+записали|я\s+не\s+просил|я\s+не\s+просила|мы\s+ещ[её]\s+ничего\s+не\s+обговорили)/iu.test(lower),
+      angry,
+      reason: angry ? "angry_cancel_or_wrong_booking" : explicitCancel.reason,
+      events: [
+        { type: "delete_word_disambiguated_as_cancel", reason: explicitCancel.reason },
+        { type: "cancel_intent_detected", reason: angry ? "angry_or_complaint" : explicitCancel.reason },
+        { type: "unsafe_action_downgraded", from: "create_appointment", to: angry ? "handoff_to_admin" : "cancel_appointment", reason: "cancel_priority" }
+      ]
+    };
+  }
+
+  if (dentalService.detected) {
+    const pricing = isInformationQuestion(lower);
+    return {
+      intent: pricing ? "pricing_question" : "booking_request",
+      sub_intent: dentalService.sub_intent,
+      action: pricing ? "provide_info" : "collect_datetime",
+      state: pricing ? "answering_question" : "collecting_booking_data",
+      shouldHandoff: false,
+      angry: false,
+      confidence: dentalService.confidence,
+      service: dentalService.service,
+      service_category: dentalService.service_category,
+      extracted: {
+        service: dentalService.service,
+        service_category: dentalService.service_category,
+        relative_date: lower.includes("послезавтра") ? "day_after_tomorrow" : (lower.includes("завтра") ? "tomorrow" : null),
+        appointment_reference: "none"
+      },
+      safe_next_action: pricing ? "provide_info" : (normalizeAppointmentTime(lower) ? "collect_date" : "collect_time"),
+      reason: dentalService.reason,
+      events: [
+        { type: "dental_service_detected", service: dentalService.service, service_category: dentalService.service_category },
+        { type: "delete_word_disambiguated_as_service", reason: dentalService.reason }
+      ]
+    };
+  }
+
+  const abuse = detectComplaintOrAbuse(lower);
+  if (abuse.detected) {
+    return {
+      intent: "abuse",
+      action: "handoff_to_admin",
+      state: "handoff_required",
+      shouldHandoff: true,
+      angry: true,
+      reason: abuse.reason,
+      events: [
+        { type: "abuse_or_complaint_detected", reason: abuse.reason },
+        { type: "unsafe_action_downgraded", from: "dialogue", to: "handoff_to_admin", reason: abuse.reason }
+      ]
+    };
+  }
+
+  const noise = detectNoiseMessage(lower);
+  if (noise.detected) {
+    return {
+      intent: "noise",
+      action: "none",
+      state: "idle",
+      shouldHandoff: false,
+      angry: false,
+      reason: noise.reason,
+      events: [{ type: "noise_detected", reason: noise.reason }]
+    };
+  }
+
+  const reschedule = /(перенести|перенесите|перезаписаться|перезапишите|другое\s+время|другой\s+день|можно\s+на\s+другое\s+время)/iu.test(lower);
+  if (reschedule) {
+    return {
+      intent: "reschedule",
+      action: "reschedule_appointment",
+      state: "reschedule_requested",
+      shouldHandoff: false,
+      angry: false,
+      reason: "reschedule_intent_detected",
+      events: [{ type: "reschedule_intent_detected" }]
+    };
+  }
+
+  return {
+    intent: "message",
+    action: "none",
+    state: "idle",
+    shouldHandoff: false,
+    angry: false,
+    events: []
+  };
+}
+
+export function detectDentalServiceIntent(text = "") {
+  const lower = String(text || "").toLowerCase();
+  const wisdom = /(удал(?:ить|ите|ение|ен[а-я]*)|вырвать|вырывать).{0,40}(зуб(?:а|ы)?\s+мудрости|мудрости|восьм[её]рк[ауи]?)|(зуб(?:а|ы)?\s+мудрости|восьм[её]рк[ауи]?).{0,40}(удал(?:ить|ите|ение|ен[а-я]*)|вырвать|вырывать)/iu.test(lower);
+  if (wisdom) {
+    return {
+      detected: true,
+      confidence: 0.98,
+      service: "удаление зуба мудрости",
+      service_category: "wisdom_tooth_extraction",
+      sub_intent: "dental_service_request",
+      reason: "delete_word_near_wisdom_tooth"
+    };
+  }
+
+  const extraction = /(удал(?:ить|ите|ение|ен[а-я]*)|вырвать|вырывать).{0,40}(зуб|зуба|зубы|корень|нерв)|(зуб|зуба|зубы|корень|нерв).{0,40}(удал(?:ить|ите|ение|ен[а-я]*)|вырвать|вырывать)/iu.test(lower);
+  if (extraction) {
+    return {
+      detected: true,
+      confidence: 0.94,
+      service: "удаление зуба",
+      service_category: "tooth_extraction",
+      sub_intent: "dental_service_request",
+      reason: "delete_word_near_tooth_entity"
+    };
+  }
+
+  return { detected: false, confidence: 0, service: null, service_category: null, sub_intent: null, reason: null };
+}
+
+export function detectExplicitAppointmentCancel(text = "") {
+  const lower = String(text || "").toLowerCase();
+
+  if (/(отменить|отмени|отмените).{0,30}(запис|при[её]м|визит|бронь)|(запис|при[её]м|визит|бронь).{0,30}(отменить|отмени|отмените)/iu.test(lower)) {
+    return { detected: true, reason: "explicit_cancel_appointment_reference" };
+  }
+
+  if (/(удалить|удалите|убрать|уберите).{0,30}(запис|при[её]м|визит|бронь)|(запис|при[её]м|визит|бронь).{0,30}(удалить|удалите|убрать|уберите)/iu.test(lower)) {
+    return { detected: true, reason: "explicit_delete_appointment_reference" };
+  }
+
+  if (/(не\s+надо|не\s+нужно|денег\s+нет|передумал|передумала|не\s+приду|не\s+актуально|зачем\s+вы\s+меня\s+записали|мы\s+еще\s+ничего\s+не\s+обговорили|мы\s+ещё\s+ничего\s+не\s+обговорили|я\s+не\s+просил|я\s+не\s+просила|запись\s+не\s+нужна)/iu.test(lower)) {
+    return { detected: true, reason: "cancel_context_without_delete_word" };
+  }
+
+  return { detected: false, reason: null };
+}
+
+export function detectAmbiguousDeleteIntent(text = "", dentalService = detectDentalServiceIntent(text), explicitCancel = detectExplicitAppointmentCancel(text)) {
+  const lower = String(text || "").toLowerCase();
+  if (!dentalService.detected || !explicitCancel.detected) return { detected: false, reason: null };
+  if (/(запис|при[её]м|визит|бронь|не\s+нужна|не\s+надо|отмен)/iu.test(lower)) {
+    return { detected: true, reason: "dental_service_and_cancel_reference" };
+  }
+  return { detected: false, reason: null };
+}
+
+function isAngryOrComplaint(text = "") {
+  return /(ебан|нах|хуй|пизд|бля|вы\s+что|почему\s+записали|зачем\s+вы\s+меня\s+записали|я\s+не\s+просил|я\s+не\s+просила|мы\s+ещ[её]\s+ничего\s+не\s+обговорили)/iu.test(String(text || ""));
+}
+
+export function detectComplaintOrAbuse(text = "") {
+  const lower = String(text || "").toLowerCase();
+  if (/(зачем\s+вы\s+меня\s+записали|почему\s+записали|я\s+не\s+просил|я\s+не\s+просила|без\s+моего\s+соглас|вы\s+что)/iu.test(lower)) {
+    return { detected: true, reason: "wrong_booking_complaint" };
+  }
+
+  if (/(вы\s+ч[еёо]\s+ебан|вы\s+ебан|ебланы|долбо[её]б|нахуй|пошли\s+нах|хуйня|пиздец|блять|блядь)/iu.test(lower)) {
+    return { detected: true, reason: "angry_abuse" };
+  }
+
+  return { detected: false, reason: null };
+}
+
+export function detectNoiseMessage(text = "") {
+  const normalized = String(text || "").replace(/\s+/gu, " ").trim();
+  const compact = normalized.replace(/[?!.,\s]/gu, "");
+  if (!normalized || !compact) return { detected: true, reason: "empty_or_punctuation" };
+  if (/^[?!.]{3,}$/u.test(normalized)) return { detected: true, reason: "punctuation_noise" };
+  if (/^(бля|блин|нах|хуй|пизд|еба|ёба|минетик|минет)$/iu.test(compact)) {
+    return { detected: true, reason: "rude_noise" };
+  }
+  if (compact.length <= 2 && !/[а-яёa-z0-9]/iu.test(compact)) {
+    return { detected: true, reason: "symbol_noise" };
+  }
+  return { detected: false, reason: null };
+}
+
+function clearAppointmentDraft(memory = {}) {
+  const cleaned = clearStaleBookingMemory(memory);
+  delete cleaned.status;
+  return cleaned;
+}
+
+export function resolveConversationState({
+  memory = {},
+  activeAppointment = null,
+  bookingIntent = false,
+  informationQuestion = false
+} = {}) {
+  if (CONVERSATION_STATES.has(memory.status)) return memory.status;
+  if (activeAppointment?.status === "confirmed") return "appointment_booked";
+  if (activeAppointment?.status === "waiting_confirmation") return "waiting_booking_confirmation";
+  if (isDraftAppointmentStatus(activeAppointment?.status)) return "collecting_booking_data";
+  if (bookingIntent) return "collecting_booking_data";
+  if (informationQuestion) return "answering_question";
+  return "idle";
+}
+
+function resolveNextConversationState({
+  currentState = "idle",
+  bookingIntent = false,
+  appointmentValidation = {},
+  appointmentRequest = null,
+  slotConflict = null,
+  activeAppointment = null,
+  informationQuestion = false,
+  agentResult = {}
+} = {}) {
+  if (currentState === "cancellation_requested" || currentState === "handoff_required") return currentState;
+  if (agentResult.should_handoff) return "handoff_required";
+  if (slotConflict) return "collecting_booking_data";
+  if (appointmentRequest?.status === "confirmed" || appointmentValidation.allowed) return "appointment_booked";
+  if (activeAppointment?.status === "confirmed") return "appointment_booked";
+  if (bookingIntent && appointmentValidation?.missing_fields?.length === 1 && appointmentValidation.missing_fields.includes("consent_to_book")) {
+    return "waiting_booking_confirmation";
+  }
+  if (bookingIntent) return "collecting_booking_data";
+  if (informationQuestion) return "answering_question";
+  return "idle";
+}
+
+export function buildSafeScriptedReply({
+  intent = "message",
+  action = "none",
+  state = "idle",
+  memory = {},
+  payload = {},
+  messageText = "",
+  activeAppointment = null,
+  afterReminder = false,
+  shouldHandoff = false
+} = {}) {
+  const name = shortName(memory.patient_name || payload.display_name || "");
+  const prefix = name ? `${name}, ` : "";
+
+  if (intent === "cancel") {
+    if (shouldHandoff) {
+      return "Вы правы, без подтверждения запись создавать нельзя. Я остановлю автоматические действия и передам администратору.";
+    }
+
+    if (activeAppointment?.status === "confirmed") {
+      return `${prefix}поняла, автоматические действия по записи остановлю. Передам администратору, чтобы отмену проверили.`;
+    }
+
+    return `${prefix}поняла, запись создавать или подтверждать не буду. Передам администратору, чтобы всё проверили.`;
+  }
+
+  if (intent === "reschedule") {
+    if (activeAppointment?.status === "confirmed") {
+      return `${prefix}поняла, можно перенести. Напишите новый удобный день и время, я проверю вариант.`;
+    }
+
+    return `${prefix}напишите удобный день и время, а администратор проверит, можно ли так записать.`;
+  }
+
+  if (intent === "greeting") {
+    if (afterReminder || state === "appointment_booked") {
+      return `${prefix}здравствуйте! Вижу, у вас была запись или напоминание. Хотите уточнить детали или изменить время?`;
+    }
+
+    if (memory.requested_service) {
+      return `${prefix}здравствуйте! Подскажу по ${memory.requested_service} и свободному времени для записи.`;
+    }
+
+    return `${prefix}здравствуйте! Подскажите, что хотите уточнить по лечению, стоимости или записи?`;
+  }
+
+  if (intent === "abuse") {
+    if (activeAppointment?.status === "confirmed" || state === "handoff_required") {
+      return "Понимаю, ситуация неприятная. Автоматические действия остановлю и передам администратору, чтобы всё проверили.";
+    }
+
+    return "Понимаю, что сообщение эмоциональное. Передам администратору, чтобы он проверил ситуацию и ответил по делу.";
+  }
+
+  if (intent === "noise") {
+    return pickNoiseReply(messageText);
+  }
+
+  return "Подскажите, пожалуйста, что хотите уточнить по услугам, стоимости или записи.";
+}
+
+function pickNoiseReply(messageText = "") {
+  const replies = [
+    "Не совсем понял сообщение. Могу помочь с услугами, стоимостью или записью.",
+    "Не разобрала, что нужно уточнить. Напишите, пожалуйста, про лечение, цену или запись.",
+    "Похоже, сообщение пришло не полностью. Напишите чуть подробнее, и я помогу.",
+    "Не совсем поняла. Если вопрос по стоматологии или записи, напишите его чуть подробнее."
+  ];
+  const hash = [...String(messageText || "")].reduce((sum, char) => sum + char.charCodeAt(0), 0);
+  return replies[hash % replies.length];
+}
+
+function buildDentalServiceInfoReply({ service = "", serviceCategory = "", messageText = "" } = {}) {
+  if (serviceCategory === "wisdom_tooth_extraction") {
+    return "Удаление зуба мудрости зависит от сложности и положения зуба. Могу сориентировать по диапазону или передать администратору для точной стоимости.";
+  }
+
+  if (serviceCategory === "tooth_extraction") {
+    return "Удаление зуба по стоимости зависит от сложности. Подскажите, какой зуб беспокоит, и я сориентирую по записи или передам вопрос администратору.";
+  }
+
+  return `${service || "Услуга"} зависит от ситуации после осмотра. Могу подсказать по записи или передать вопрос администратору.`;
+}
+
+function isUnsafeDentalServiceAction(result = {}) {
+  return result.intent === "cancel" ||
+    result.action === "cancel_appointment" ||
+    result.action === "handoff_to_admin" ||
+    result.memory_update?.status === "cancellation_requested" ||
+    result.memory_patch?.status === "cancellation_requested";
+}
+
+function isUnsafeDentalServiceReply(reply = "") {
+  return /(отмен(ил|ю|ять|а|им)|удал(ил|ю|ять).{0,30}(запис|при[её]м|визит|бронь)|передам.{0,50}отмен|запис[ьи].{0,30}не\s+буду|автоматические\s+действия\s+останов)/iu.test(String(reply || ""));
+}
+
+function isGreetingOnly(text = "") {
+  return /^(здравствуйте|здравствуй|добрый\s+день|добрый\s+вечер|доброе\s+утро|привет|дратути)[!.?\s]*$/iu.test(String(text || "").trim());
+}
+
+function shouldUseContextualGreeting({ recentMessages = [], activeAppointment = null, memory = {} } = {}) {
+  if (activeAppointment) return true;
+  if (memory?.status === "appointment_booked") return true;
+  return recentMessages.length === 0;
+}
+
+async function hasRecentSentReminder(appointmentRequestId) {
+  if (!appointmentRequestId) return false;
+  const reminder = await prisma.appointmentReminder.findFirst({
+    where: {
+      appointmentRequestId,
+      status: "sent",
+      sentAt: { gte: new Date(Date.now() - 48 * 60 * 60 * 1000) }
+    },
+    orderBy: { sentAt: "desc" }
+  });
+  return Boolean(reminder);
+}
+
+function shouldHumanizeReplySource(replySource = "") {
+  return new Set([
+    "booking_progress",
+    "booking_confirmed",
+    "slot_conflict",
+    "post_booking_social",
+    "dental_service_info"
+  ]).has(replySource);
+}
+
+export function validateAppointmentCreation(output = {}, memory = {}, context = {}) {
+  const messageText = context.messageText || "";
+  const missingFields = [...new Set(context.missingFields || [])];
+  const explicitConfirmation = hasExplicitBookingConfirmation(messageText) || memory.consent_to_book === true;
+  const effectiveMissing = explicitConfirmation
+    ? missingFields.filter((field) => field !== "consent_to_book")
+    : [...new Set([...missingFields, "consent_to_book"])];
+
+  if (context.cancelIntent || memory.status === "cancellation_requested" || memory.status === "handoff_required" || context.conversationState === "cancellation_requested" || context.conversationState === "handoff_required") {
+    return {
+      allowed: false,
+      missing_fields: [],
+      downgraded_action: memory.status === "handoff_required" || context.conversationState === "handoff_required" ? "handoff_to_admin" : "cancel_appointment",
+      reason: "cancel_or_handoff_state_blocks_booking"
+    };
+  }
+
+  if (context.conversationState === "reschedule_requested") {
+    return {
+      allowed: false,
+      missing_fields: effectiveMissing,
+      downgraded_action: "reschedule_appointment",
+      reason: "reschedule_state_blocks_new_booking"
+    };
+  }
+
+  if (!context.bookingIntent) {
+    return {
+      allowed: false,
+      missing_fields: effectiveMissing,
+      downgraded_action: isInformationQuestion(messageText) ? "answer_question" : "none",
+      reason: "no_explicit_booking_intent"
+    };
+  }
+
+  if (!explicitConfirmation) {
+    return {
+      allowed: false,
+      missing_fields: effectiveMissing,
+      downgraded_action: "offer_booking",
+      reason: "missing_explicit_confirmation"
+    };
+  }
+
+  if (effectiveMissing.length > 0) {
+    return {
+      allowed: false,
+      missing_fields: effectiveMissing,
+      downgraded_action: chooseDowngradedBookingAction(effectiveMissing),
+      reason: "missing_required_booking_fields"
+    };
+  }
+
+  return {
+    allowed: true,
+    missing_fields: [],
+    downgraded_action: output.action === "create_appointment" ? "create_appointment" : "none",
+    reason: null
+  };
+}
+
+function chooseDowngradedBookingAction(missingFields = []) {
+  if (missingFields.includes("patient_name")) return "collect_name";
+  if (missingFields.includes("contact")) return "collect_phone";
+  if (missingFields.includes("preferred_date") || missingFields.includes("preferred_time")) return "collect_datetime";
+  if (missingFields.includes("reason")) return "collect_more_info";
+  if (missingFields.includes("consent_to_book")) return "offer_booking";
+  return "collect_more_info";
+}
+
+function hasExplicitBookingRequest(text = "") {
+  const lower = String(text || "").toLowerCase();
+  if (isInformationQuestion(lower)) return false;
+  return /(запишите\s+меня|хочу\s+записа|можно\s+записа|давайте\s+запиш|подходит,\s*запиш|да,\s*запиш|запишите\s+на|записывайте|оформите\s+запись|забронируйте|book|appointment)/iu.test(lower);
+}
+
+function hasExplicitBookingConfirmation(text = "") {
+  const lower = String(text || "").toLowerCase();
+  if (isInformationQuestion(lower)) return false;
+  return /(запишите\s+меня|хочу\s+записа|да,\s*запиш|^подходит[!.?\s]*$|подходит,\s*запиш|^давайте[!.?\s]*$|давайте\s+запиш|запишите\s+на|записывайте|оформите\s+запись|фиксируйте\s+запись|подтверждаю\s+запись)/iu.test(lower);
+}
+
+function isInformationQuestion(text = "") {
+  const lower = String(text || "").toLowerCase();
+  return /(сколько|скок|скока|цена|стоимост|прайс|какие\s+врачи|какой\s+врач|кто\s+врач|когда\s+можно|есть\s+ли\s+врач|консультаци|при[её]м\s+сколько|можно\s+приехать)/iu.test(lower) &&
+    !/(запишите|хочу\s+записа|давайте\s+запиш|подходит,\s*запиш|оформите\s+запись)/iu.test(lower);
+}
+
+async function logPipelineEvents({ conversationId, events = [] }) {
+  const relevantEvents = events.filter(Boolean);
+  if (!relevantEvents.length) return;
+
+  await prisma.agentAction.createMany({
+    data: relevantEvents.map((event) => ({
+      conversationId,
+      actionType: event.type || "pipeline_event",
+      reason: event.reason || null,
+      payload: event
+    }))
+  });
+}
+
 function sanitizeAgentMemoryUpdate(update = {}, messageText = "") {
   const cleaned = { ...(update || {}) };
   const lower = String(messageText || "").toLowerCase().trim();
@@ -544,18 +1661,39 @@ function shouldContinueBookingDraft({ messageText, agentResult = {}, determinist
 
   if (hasActionableBookingFacts(deterministicFacts)) return true;
   if (hasActionableBookingFacts(memoryUpdate)) return true;
-  if (agentResult.intent === "book_appointment") return true;
+  if (isAgentBookingIntent(agentResult.intent)) return true;
 
   return false;
 }
 
-function shouldUseWorkflowProgressReply({ agentReply = "", missingFields = [], messageText = "" }) {
+function isAgentBookingIntent(intent) {
+  return intent === "book_appointment" || intent === "booking";
+}
+
+export function shouldUseWorkflowProgressReply({ agentReply = "", missingFields = [], messageText = "" }) {
   const reply = String(agentReply || "").trim().toLowerCase();
   if (!reply) return true;
 
   const lowerMessage = String(messageText || "").toLowerCase();
   if (/(какие|что есть|услуг|цен|стоимост|прайс|сколько стоит)/iu.test(lowerMessage)) {
     return false;
+  }
+
+  const claimsBookingDone = /(готово|записал[аи]?|записываю|запись подтвержд|жд[её]м|напоминание.{0,40}создан|приходите|вас записали)/iu.test(reply);
+  if (missingFields.length > 0 && claimsBookingDone) {
+    return true;
+  }
+
+  if (missingFields.includes("patient_name") && !/(как вас зовут|имя|зовут)/iu.test(reply)) {
+    return true;
+  }
+
+  if (missingFields.includes("contact") && !/(телефон|номер|контакт|как с вами связаться)/iu.test(reply)) {
+    return true;
+  }
+
+  if (missingFields.includes("reason") && !/(что беспокоит|какая услуга|услуг|жалоб|причин)/iu.test(reply)) {
+    return true;
   }
 
   const genericPatterns = [
@@ -611,6 +1749,16 @@ function sanitizeStaleBookingReply({ reply = "", messageText = "", memory = {}, 
   return name
     ? `${name}, уточните, пожалуйста, что сейчас нужно: услуги, цена или новая запись?`
     : "Уточните, пожалуйста, что сейчас нужно: услуги, цена или новая запись?";
+}
+
+function softenInformationQuestionReply(reply = "", { messageText = "", bookingIntent = false } = {}) {
+  if (bookingIntent || !isInformationQuestion(messageText)) return reply;
+
+  return String(reply || "")
+    .replace(/\s*(?:Когда|На какой день|Во сколько)\s+[^.!?]{0,80}(?:удобно|сможете|можете)[^.!?]*\?/giu, " Если решите записаться на консультацию, помогу подобрать время.")
+    .replace(/\s*Хотите\s+записаться[^.!?]*\?/giu, " Если решите записаться, помогу подобрать время.")
+    .replace(/\s+/gu, " ")
+    .trim();
 }
 
 function buildPostBookingSocialReply({ messageText, appointmentRequest, memory }) {
@@ -706,8 +1854,8 @@ function buildBookingProgressReply({ memory, payload, missingFields, messageText
   if (missingFields.includes("consent_to_book")) {
     const replyDate = date ? formatReplyDate(date, casual) : null;
     return casual
-      ? `${prefix}${service}${replyDate ? ` на ${replyDate}` : ""}${time ? ` в ${time}` : ""}. Фиксирую?`
-      : `${prefix}проверяю данные: ${service}${replyDate ? ` на ${replyDate}` : ""}${time ? ` в ${time}` : ""}. Подтвердите, зафиксировать запись?`;
+      ? `${prefix}${service}${replyDate ? ` на ${replyDate}` : ""}${time ? ` в ${time}` : ""}. Записать вас?`
+      : `${prefix}${service}${replyDate ? ` на ${replyDate}` : ""}${time ? ` в ${time}` : ""}. Подтвердите, записать вас?`;
   }
 
   return casual

@@ -9,5 +9,8 @@ export const config = {
   groqMaxTokens: Number(process.env.GROQ_MAX_TOKENS || 650),
   clinicName: process.env.CLINIC_NAME || "DentalCare",
   clinicPhone: process.env.CLINIC_PHONE || "",
-  clinicAddress: process.env.CLINIC_ADDRESS || ""
+  clinicAddress: process.env.CLINIC_ADDRESS || "",
+  reminderSendWindowStart: process.env.REMINDER_SEND_WINDOW_START || "09:00",
+  reminderSendWindowEnd: process.env.REMINDER_SEND_WINDOW_END || "21:00",
+  reminderTimezone: process.env.REMINDER_TIMEZONE || "Europe/Moscow"
 };

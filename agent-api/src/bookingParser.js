@@ -29,7 +29,8 @@ const SERVICE_MARKERS = [
   { markers: ["периодонтит"], service: "лечение периодонтита" },
   { markers: ["лечение", "лечить", "терапевт"], service: "лечение зубов" },
   { markers: ["чистк", "гигиен", "air flow", "аир флоу"], service: "профессиональная гигиена" },
-  { markers: ["удален", "удалит", "вырывать", "вырвать"], service: "удаление зуба" },
+  { markers: ["зуб мудрости", "зуба мудрости", "зубы мудрости", "восьмерк", "восьмёрк"], service: "удаление зуба мудрости" },
+  { markers: ["удален", "удалит", "удалите зуб", "удалить зуб", "вырывать", "вырвать"], service: "удаление зуба" },
   { markers: ["имплант"], service: "имплантация" },
   { markers: ["коронк", "протез"], service: "ортопедия" },
   { markers: ["брекет", "элайнер", "ортодонт"], service: "ортодонтия" },
@@ -38,34 +39,40 @@ const SERVICE_MARKERS = [
 ];
 
 const BOOKING_MARKERS = [
-  "запис",
-  "запиш",
-  "прием",
-  "приём",
-  "талон",
-  "окно",
-  "визит",
-  "попасть",
-  "к врачу",
-  "свободное время",
-  "заброниру",
+  "запишите меня",
+  "хочу записаться",
+  "хочу записатся",
+  "можно записаться",
+  "можно записатся",
+  "давайте запишемся",
+  "давайте запишите",
+  "подходит, запишите",
+  "да, запишите",
+  "запишите на",
+  "запишите в",
+  "запиши на",
+  "запиши в",
+  "записывайте",
+  "записывай",
+  "оформите запись",
+  "подтверждаю запись",
+  "забронируйте",
+  "бронь",
   "book",
   "appointment"
 ];
 
 const CONSENT_MARKERS = [
-  "согласен",
-  "согласна",
+  "согласен на запись",
+  "согласна на запись",
   "подтверждаю",
-  "подходит",
-  "давайте",
+  "подтверждаю запись",
+  "подходит, запишите",
+  "давайте запишемся",
   "записывайте",
   "запишите",
-  "оформляйте",
-  "фиксируйте",
-  "можно",
-  "ок",
-  "окей",
+  "оформляйте запись",
+  "фиксируйте запись",
   "yes"
 ];
 
@@ -123,6 +130,7 @@ export function extractBookingFacts(messageText, baseDate = new Date()) {
 export function isBookingIntent({ text = "", memory = {}, modelIntent = "" } = {}) {
   if (modelIntent === "book_appointment") return true;
   if (memory?.intent === "book_appointment") return true;
+  if (isDentalServiceBookingText(String(text).toLowerCase(), memory)) return true;
   return isBookingText(String(text).toLowerCase());
 }
 
@@ -239,11 +247,30 @@ export function buildClinicDateTime(preferredDate, preferredTime) {
 }
 
 function isBookingText(lower) {
-  return BOOKING_MARKERS.some((marker) => lower.includes(marker));
+  const text = String(lower || "");
+  if (isInformationQuestion(text)) return false;
+  return BOOKING_MARKERS.some((marker) => text.includes(marker));
+}
+
+function isDentalServiceBookingText(lower, memory = {}) {
+  const text = String(lower || "");
+  if (isInformationQuestion(text)) return false;
+  if (!memory?.requested_service && !extractService(text)) return false;
+
+  return /(нужно|надо|хочу|можно|удобно|завтра|послезавтра|сегодня|понедельник|вторник|сред[ау]|четверг|пятниц[ау]|суббот[ау]|воскресенье|\b\d{1,2}:\d{2}\b|\bв\s*\d{1,2}\b)/iu.test(text);
 }
 
 function hasConsent(lower) {
-  return CONSENT_MARKERS.some((marker) => lower.includes(marker)) || /(^|\s)да($|[\s,!.])/u.test(lower);
+  const text = String(lower || "");
+  if (isInformationQuestion(text)) return false;
+  return CONSENT_MARKERS.some((marker) => text.includes(marker)) ||
+    /(?:^|\s)да[,!\s]+(?:запишите|записывайте|давайте\s+запиш)/u.test(text);
+}
+
+function isInformationQuestion(lower = "") {
+  const text = String(lower || "");
+  return /(сколько|скок|скока|цена|стоимост|прайс|какие\s+врачи|какой\s+врач|кто\s+врач|когда\s+можно|есть\s+ли\s+врач|консультаци|прием\s+сколько|приём\s+сколько)/u.test(text) &&
+    !/(запишите|хочу\s+запис|давайте\s+запиш|подходит,\s*запиш|оформите\s+запись)/u.test(text);
 }
 
 function extractPhone(text) {

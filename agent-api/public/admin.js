@@ -259,7 +259,7 @@ async function loadAppointments() {
             <td>${escapeHtml(appointment.preferredTime || "-")}</td>
             <td>
               <select class="form-select form-select-sm appointment-status" data-appointment-id="${appointment.id}">
-                ${["new", "collecting", "pending", "waiting_confirmation", "confirmed", "cancelled"].map((statusOption) => `
+                ${["new", "collecting", "pending", "waiting_confirmation", "confirmed", "cancelled", "needs_admin_review"].map((statusOption) => `
                   <option value="${statusOption}" ${appointment.status === statusOption ? "selected" : ""}>${statusOption}</option>
                 `).join("")}
               </select>
