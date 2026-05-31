@@ -8,108 +8,137 @@
     <link rel="stylesheet" href="/admin/assets/styles.css">
   </head>
   <body>
-    <nav class="navbar navbar-expand-lg border-bottom bg-white sticky-top">
-      <div class="container-fluid">
-        <a class="navbar-brand fw-semibold" href="/admin">DentalCare Admin</a>
-        <span class="badge text-bg-light border">AI admin MVP</span>
-        <div class="ms-auto d-flex gap-2">
-          <button class="btn btn-sm btn-outline-secondary" id="refreshAllButton" type="button">Обновить</button>
-          <a class="btn btn-sm btn-primary" href="/health" target="_blank" rel="noreferrer">Health</a>
+    <nav class="topbar">
+      <div class="brand">
+        <span class="brand-mark">DC</span>
+        <div>
+          <div class="brand-title">DentalCare Admin</div>
+          <div class="brand-subtitle">операционная панель AI-агента</div>
         </div>
+      </div>
+      <div class="topbar-actions">
+        <span class="status-pill" id="healthPill">проверка</span>
+        <button class="btn btn-sm btn-outline-secondary" id="refreshAllButton" type="button">Обновить</button>
+        <a class="btn btn-sm btn-primary" href="/health" target="_blank" rel="noreferrer">Health</a>
       </div>
     </nav>
 
     <div class="app-shell">
-      <aside class="sidebar border-end bg-white">
-        <button class="nav-link active" data-page="dashboard" type="button">Дашборд</button>
-        <button class="nav-link" data-page="conversations" type="button">Переписки</button>
-        <button class="nav-link" data-page="appointments" type="button">Заявки</button>
-        <button class="nav-link" data-page="broadcast" type="button">Рассылка</button>
-        <button class="nav-link" data-page="prompts" type="button">Промт и база знаний</button>
-        <button class="nav-link" data-page="database" type="button">База данных</button>
-        <button class="nav-link" data-page="test" type="button">Тест агента</button>
+      <aside class="sidebar">
+        <button class="side-link active" data-page="dashboard" type="button"><span>Обзор</span></button>
+        <button class="side-link" data-page="conversations" type="button"><span>Переписки</span></button>
+        <button class="side-link" data-page="appointments" type="button"><span>Заявки</span></button>
+        <button class="side-link" data-page="broadcast" type="button"><span>Рассылка</span></button>
+        <button class="side-link" data-page="prompts" type="button"><span>Промпты</span></button>
+        <button class="side-link" data-page="database" type="button"><span>База данных</span></button>
+        <button class="side-link" data-page="test" type="button"><span>Тест агента</span></button>
       </aside>
 
       <main class="content">
         <section class="page-section active" id="page-dashboard">
-          <div class="d-flex align-items-center justify-content-between gap-3 mb-3">
+          <div class="page-head">
             <div>
-              <h1 class="h4 mb-1">Панель управления</h1>
-              <p class="text-secondary mb-0">Короткая сводка по сообщениям, заявкам и напоминаниям.</p>
+              <h1>Обзор</h1>
+              <div class="muted">Состояние диалогов, записей, handoff и очереди.</div>
             </div>
             <button class="btn btn-outline-primary" id="copyReportButton" type="button">Скопировать отчет</button>
           </div>
 
-          <div class="row g-3" id="statsGrid"></div>
+          <div class="stats-grid" id="statsGrid"></div>
 
-          <div class="row g-3 mt-1">
-            <div class="col-lg-5">
-              <div class="panel h-100">
-                <div class="panel-header">Отчет для руководителя</div>
-                <pre class="report-box mb-0" id="todayReport">Загрузка...</pre>
-              </div>
-            </div>
-            <div class="col-lg-7">
-              <div class="panel h-100">
-                <div class="panel-header">Последние сообщения</div>
-                <div class="list-group list-group-flush" id="latestMessages"></div>
-              </div>
-            </div>
+          <div class="dashboard-grid mt-3">
+            <section class="panel">
+              <div class="panel-title">Отчет за сегодня</div>
+              <pre class="report-box" id="todayReport">Загрузка...</pre>
+            </section>
+            <section class="panel">
+              <div class="panel-title">Последние сообщения</div>
+              <div class="list-stack" id="latestMessages"></div>
+            </section>
           </div>
         </section>
 
         <section class="page-section" id="page-conversations">
-          <div class="d-flex align-items-center justify-content-between gap-3 mb-3">
+          <div class="page-head">
             <div>
-              <h1 class="h4 mb-1">Переписки</h1>
-              <p class="text-secondary mb-0">История сообщений, память диалога, заявки и handoff.</p>
+              <h1>Переписки</h1>
+              <div class="muted">История сообщений, память диалога, заявки и handoff.</div>
             </div>
-            <form class="search-form" id="conversationSearchForm">
-              <input class="form-control" id="conversationSearch" placeholder="Поиск по имени, MAX ID или тексту">
-              <button class="btn btn-primary" type="submit">Найти</button>
-            </form>
           </div>
 
-          <div class="row g-3">
-            <div class="col-lg-4">
-              <div class="panel conversation-list" id="conversationList"></div>
-            </div>
-            <div class="col-lg-8">
-              <div class="panel conversation-detail" id="conversationDetail">
-                <div class="empty-state">Выберите переписку слева.</div>
+          <form class="toolbar" id="conversationSearchForm">
+            <input class="form-control" id="conversationSearch" placeholder="Имя, MAX ID или текст">
+            <select class="form-select" id="conversationStatusFilter">
+              <option value="">Все статусы</option>
+              <option value="active">active</option>
+              <option value="human_takeover">human_takeover</option>
+              <option value="handoff_required">handoff_required</option>
+            </select>
+            <select class="form-select compact-control" id="conversationPageSize">
+              <option value="15">15</option>
+              <option value="30" selected>30</option>
+              <option value="60">60</option>
+            </select>
+            <button class="btn btn-primary" type="submit">Найти</button>
+          </form>
+
+          <div class="split-view">
+            <section class="panel">
+              <div class="panel-title with-meta">
+                <span>Диалоги</span>
+                <span class="muted" id="conversationCount">0</span>
               </div>
-            </div>
+              <div class="conversation-list" id="conversationList"></div>
+              <div class="pagination-bar" id="conversationPagination"></div>
+            </section>
+            <section class="panel conversation-detail" id="conversationDetail">
+              <div class="empty-state">Выберите переписку слева.</div>
+            </section>
           </div>
         </section>
 
         <section class="page-section" id="page-appointments">
-          <div class="d-flex align-items-center justify-content-between gap-3 mb-3">
+          <div class="page-head">
             <div>
-              <h1 class="h4 mb-1">Заявки и напоминания</h1>
-              <p class="text-secondary mb-0">Записи, статусы, слоты и созданные напоминания.</p>
-            </div>
-            <div class="d-flex gap-2">
-              <select class="form-select" id="appointmentStatusFilter">
-                <option value="">Все статусы</option>
-                <option value="new">new</option>
-                <option value="collecting">collecting</option>
-                <option value="pending">pending</option>
-                <option value="waiting_confirmation">waiting_confirmation</option>
-                <option value="confirmed">confirmed</option>
-                <option value="cancelled">cancelled</option>
-              </select>
-              <button class="btn btn-primary" id="reloadAppointmentsButton" type="button">Показать</button>
+              <h1>Заявки</h1>
+              <div class="muted">Записи, статусы, слоты и напоминания.</div>
             </div>
           </div>
 
-          <div class="panel">
-            <div class="table-responsive">
+          <form class="toolbar toolbar-wide" id="appointmentFilterForm">
+            <input class="form-control" id="appointmentSearch" placeholder="Имя, телефон, MAX ID, услуга">
+            <select class="form-select" id="appointmentStatusFilter">
+              <option value="">Все статусы</option>
+              <option value="new">new</option>
+              <option value="collecting">collecting</option>
+              <option value="pending">pending</option>
+              <option value="waiting_confirmation">waiting_confirmation</option>
+              <option value="confirmed">confirmed</option>
+              <option value="cancelled">cancelled</option>
+              <option value="needs_admin_review">needs_admin_review</option>
+            </select>
+            <input class="form-control" id="appointmentDateFrom" type="date">
+            <input class="form-control" id="appointmentDateTo" type="date">
+            <select class="form-select compact-control" id="appointmentPageSize">
+              <option value="20">20</option>
+              <option value="30" selected>30</option>
+              <option value="50">50</option>
+            </select>
+            <button class="btn btn-primary" type="submit">Показать</button>
+          </form>
+
+          <section class="panel">
+            <div class="panel-title with-meta">
+              <span>Список заявок</span>
+              <span class="muted" id="appointmentCount">0</span>
+            </div>
+            <div class="table-responsive data-table-wrap">
               <table class="table table-sm align-middle mb-0">
                 <thead>
                   <tr>
                     <th>ID</th>
                     <th>Пациент</th>
-                    <th>Жалоба / услуга</th>
+                    <th>Услуга / жалоба</th>
                     <th>Дата</th>
                     <th>Время</th>
                     <th>Статус</th>
@@ -120,78 +149,98 @@
                 <tbody id="appointmentsTable"></tbody>
               </table>
             </div>
-          </div>
+            <div class="pagination-bar" id="appointmentPagination"></div>
+          </section>
         </section>
 
         <section class="page-section" id="page-broadcast">
-          <div class="d-flex align-items-center justify-content-between gap-3 mb-3">
+          <div class="page-head">
             <div>
-              <h1 class="h4 mb-1">Рассылка</h1>
-              <p class="text-secondary mb-0">Индивидуальные сообщения клиентам: годовая профгигиена или ручная кампания по фильтрам.</p>
+              <h1>Рассылка</h1>
+              <div class="muted">Подбор аудитории, ручные сообщения и очередь отправки.</div>
             </div>
-            <button class="btn btn-outline-primary" id="reloadOutboundQueueButton" type="button">Обновить очередь</button>
           </div>
 
-          <div class="row g-3">
-            <div class="col-xl-5">
-              <div class="panel">
-                <div class="panel-header">Новая кампания</div>
-                <div class="p-3">
-                  <div class="mb-3">
-                    <label class="form-label" for="broadcastMode">Тип рассылки</label>
-                    <select class="form-select" id="broadcastMode">
-                      <option value="annual_hygiene">Годовая профгигиена</option>
-                      <option value="custom">Ручная по фильтрам</option>
-                    </select>
-                  </div>
-                  <div class="mb-3">
-                    <label class="form-label" for="broadcastName">Название</label>
-                    <input class="form-control" id="broadcastName" value="Рассылка DentalCare">
-                  </div>
-                  <div class="row g-2 mb-3">
-                    <div class="col-md-6">
-                      <label class="form-label" for="broadcastServiceQuery">Услуга содержит</label>
-                      <input class="form-control" id="broadcastServiceQuery" value="гигиен">
-                    </div>
-                    <div class="col-md-6">
-                      <label class="form-label" for="broadcastVisitedBefore">Были раньше, дней</label>
-                      <input class="form-control" id="broadcastVisitedBefore" type="number" min="1" value="365">
-                    </div>
-                  </div>
-                  <div class="row g-2 mb-3">
-                    <div class="col-md-6">
-                      <label class="form-label" for="broadcastLimit">Лимит</label>
-                      <input class="form-control" id="broadcastLimit" type="number" min="1" max="1000" value="100">
-                    </div>
-                    <div class="col-md-6 d-flex align-items-end">
-                      <div class="form-check">
-                        <input class="form-check-input" id="broadcastUseAi" type="checkbox">
-                        <label class="form-check-label" for="broadcastUseAi">ИИ-персонализация</label>
-                      </div>
-                    </div>
-                  </div>
-                  <div class="mb-3">
-                    <label class="form-label" for="broadcastPrompt">Промт / шаблон</label>
-                    <textarea class="form-control" id="broadcastPrompt" rows="6">Напиши короткое персональное сообщение пациенту стоматологии. Напомни, что профессиональную гигиену полости рта обычно рекомендуют проходить примерно раз в год. Тон спокойный, человеческий, без давления. Предложи записаться на удобное время.</textarea>
-                    <div class="form-text">Можно использовать переменные: {{name}}, {{last_service}}, {{last_visit_date}}, {{clinic_name}}.</div>
-                  </div>
-                  <div class="d-flex gap-2">
-                    <button class="btn btn-outline-secondary" id="previewBroadcastButton" type="button">Предпросмотр</button>
-                    <button class="btn btn-primary" id="createBroadcastButton" type="button">Создать рассылку</button>
-                  </div>
+          <div class="broadcast-layout">
+            <section class="panel">
+              <div class="panel-title">Фильтры получателей</div>
+              <form class="form-grid p-3" id="broadcastRecipientForm">
+                <label>
+                  <span>Тип подбора</span>
+                  <select class="form-select" id="broadcastMode">
+                    <option value="annual_hygiene">Годовая профгигиена</option>
+                    <option value="custom">Ручной фильтр</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Услуга содержит</span>
+                  <input class="form-control" id="broadcastServiceQuery" value="гигиен">
+                </label>
+                <label>
+                  <span>Были раньше, дней</span>
+                  <input class="form-control" id="broadcastVisitedBefore" type="number" min="1" value="365">
+                </label>
+                <label>
+                  <span>Были позже, дней</span>
+                  <input class="form-control" id="broadcastVisitedAfter" type="number" min="1">
+                </label>
+                <label>
+                  <span>На странице</span>
+                  <select class="form-select" id="broadcastPageSize">
+                    <option value="15">15</option>
+                    <option value="25" selected>25</option>
+                    <option value="50">50</option>
+                  </select>
+                </label>
+                <label class="check-row">
+                  <input class="form-check-input" id="broadcastOnlyWithVisits" type="checkbox" checked>
+                  <span>только с визитами</span>
+                </label>
+                <div class="form-actions">
+                  <button class="btn btn-primary" type="submit">Подобрать</button>
+                  <button class="btn btn-outline-secondary" id="clearBroadcastSelectionButton" type="button">Сбросить выбор</button>
                 </div>
+              </form>
+            </section>
+
+            <section class="panel">
+              <div class="panel-title with-meta">
+                <span>Сообщение</span>
+                <span class="muted" id="broadcastSelectedCount">0 выбрано</span>
               </div>
-            </div>
-            <div class="col-xl-7">
-              <div class="panel mb-3">
-                <div class="panel-header d-flex justify-content-between gap-2">
-                  <span>Получатели</span>
-                  <span class="small-muted" id="broadcastRecipientCount">0</span>
+              <div class="p-3">
+                <textarea class="form-control" id="manualBroadcastMessage" rows="6">Здравствуйте, {{name}}! До 1 июля в клинике действует специальное предложение. Если хотите, подберем удобное время для консультации.</textarea>
+                <div class="row g-2 mt-2">
+                  <div class="col-6">
+                    <label class="form-label" for="broadcastWindowStart">Отправлять с</label>
+                    <input class="form-control" id="broadcastWindowStart" type="time" value="09:00">
+                  </div>
+                  <div class="col-6">
+                    <label class="form-label" for="broadcastWindowEnd">До</label>
+                    <input class="form-control" id="broadcastWindowEnd" type="time" value="21:00">
+                  </div>
                 </div>
-                <div class="table-responsive broadcast-table">
+                <div class="d-flex flex-wrap gap-2 mt-3">
+                  <button class="btn btn-outline-primary" id="dryRunManualBroadcastButton" type="button">Предпросмотр</button>
+                  <button class="btn btn-primary" id="sendManualBroadcastButton" type="button">Поставить в очередь</button>
+                </div>
+                <div class="preview-stack mt-3" id="manualBroadcastPreview"></div>
+              </div>
+            </section>
+          </div>
+
+          <div class="row g-3 mt-1">
+            <div class="col-xl-7">
+              <section class="panel">
+                <div class="panel-title with-meta">
+                  <span>Получатели</span>
+                  <span class="muted" id="broadcastRecipientCount">0</span>
+                </div>
+                <div class="table-responsive data-table-wrap">
                   <table class="table table-sm align-middle mb-0">
                     <thead>
                       <tr>
+                        <th class="select-col"><input class="form-check-input" id="selectBroadcastPage" type="checkbox"></th>
                         <th>Клиент</th>
                         <th>MAX</th>
                         <th>Последняя услуга</th>
@@ -201,95 +250,136 @@
                     <tbody id="broadcastRecipientsTable"></tbody>
                   </table>
                 </div>
-              </div>
-              <div class="panel">
-                <div class="panel-header">Исходящая очередь</div>
-                <div class="table-responsive broadcast-table">
-                  <table class="table table-sm align-middle mb-0">
-                    <thead>
-                      <tr>
-                        <th>ID</th>
-                        <th>Клиент</th>
-                        <th>Тип</th>
-                        <th>Статус</th>
-                        <th>Сообщение</th>
-                        <th>Когда</th>
-                      </tr>
-                    </thead>
-                    <tbody id="outboundQueueTable"></tbody>
-                  </table>
+                <div class="pagination-bar" id="broadcastRecipientPagination"></div>
+              </section>
+            </div>
+            <div class="col-xl-5">
+              <section class="panel mb-3">
+                <div class="panel-title">Кампания по фильтрам</div>
+                <div class="p-3">
+                  <input class="form-control mb-2" id="broadcastName" value="Рассылка DentalCare">
+                  <textarea class="form-control" id="broadcastPrompt" rows="5">Напиши короткое персональное сообщение пациенту стоматологии. Напомни про профессиональную гигиену раз в год. Тон спокойный, без давления.</textarea>
+                  <label class="check-row mt-2">
+                    <input class="form-check-input" id="broadcastUseAi" type="checkbox">
+                    <span>AI-персонализация для каждого клиента</span>
+                  </label>
+                  <button class="btn btn-outline-primary mt-3" id="createBroadcastButton" type="button">Создать кампанию</button>
                 </div>
-              </div>
+              </section>
+              <section class="panel">
+                <div class="panel-title">Предпросмотр ручной рассылки</div>
+                <div class="preview-stack" id="manualBroadcastDryRunResult"></div>
+              </section>
             </div>
           </div>
+
+          <section class="panel mt-3">
+            <div class="panel-title with-meta">
+              <span>Исходящая очередь</span>
+              <span class="muted" id="outboundQueueCount">0</span>
+            </div>
+            <form class="toolbar" id="outboundQueueForm">
+              <input class="form-control" id="outboundSearch" placeholder="Клиент, MAX ID или текст">
+              <select class="form-select" id="outboundStatusFilter">
+                <option value="">Все статусы</option>
+                <option value="queued">queued</option>
+                <option value="processing">processing</option>
+                <option value="sent">sent</option>
+                <option value="failed">failed</option>
+              </select>
+              <select class="form-select" id="outboundTypeFilter">
+                <option value="">Все типы</option>
+                <option value="manual_broadcast">manual_broadcast</option>
+                <option value="annual_hygiene">annual_hygiene</option>
+                <option value="broadcast">broadcast</option>
+              </select>
+              <select class="form-select compact-control" id="outboundPageSize">
+                <option value="20">20</option>
+                <option value="30" selected>30</option>
+                <option value="50">50</option>
+              </select>
+              <button class="btn btn-primary" type="submit">Показать</button>
+            </form>
+            <div class="table-responsive data-table-wrap">
+              <table class="table table-sm align-middle mb-0">
+                <thead>
+                  <tr>
+                    <th>ID</th>
+                    <th>Клиент</th>
+                    <th>Тип</th>
+                    <th>Статус</th>
+                    <th>Сообщение</th>
+                    <th>Когда</th>
+                  </tr>
+                </thead>
+                <tbody id="outboundQueueTable"></tbody>
+              </table>
+            </div>
+            <div class="pagination-bar" id="outboundPagination"></div>
+          </section>
         </section>
 
         <section class="page-section" id="page-prompts">
-          <div class="d-flex align-items-center justify-content-between gap-3 mb-3">
+          <div class="page-head">
             <div>
-              <h1 class="h4 mb-1">Промт и база знаний</h1>
-              <p class="text-secondary mb-0">Здесь можно менять поведение агента, цены и контекст клиники.</p>
+              <h1>Промпты</h1>
+              <div class="muted">Системный промпт и база знаний клиники.</div>
             </div>
             <button class="btn btn-primary" id="savePromptsButton" type="button">Сохранить</button>
           </div>
-
-          <div class="row g-3">
-            <div class="col-lg-6">
-              <div class="panel">
-                <div class="panel-header">Системный промт</div>
-                <textarea class="form-control code-editor" id="systemPromptInput" spellcheck="false"></textarea>
-              </div>
-            </div>
-            <div class="col-lg-6">
-              <div class="panel">
-                <div class="panel-header">База знаний и цены</div>
-                <textarea class="form-control code-editor" id="clinicKnowledgeInput" spellcheck="false"></textarea>
-              </div>
-            </div>
+          <div class="editor-grid">
+            <section class="panel">
+              <div class="panel-title">Системный промпт</div>
+              <textarea class="form-control code-editor" id="systemPromptInput" spellcheck="false"></textarea>
+            </section>
+            <section class="panel">
+              <div class="panel-title">База знаний и цены</div>
+              <textarea class="form-control code-editor" id="clinicKnowledgeInput" spellcheck="false"></textarea>
+            </section>
           </div>
         </section>
 
         <section class="page-section" id="page-database">
-          <div class="d-flex align-items-center justify-content-between gap-3 mb-3">
+          <div class="page-head">
             <div>
-              <h1 class="h4 mb-1">Просмотр базы данных</h1>
-              <p class="text-secondary mb-0">Быстрый просмотр основных таблиц PostgreSQL без Prisma Studio.</p>
-            </div>
-            <div class="d-flex gap-2">
-              <select class="form-select" id="dbTableSelect"></select>
-              <button class="btn btn-primary" id="loadDbTableButton" type="button">Открыть</button>
+              <h1>База данных</h1>
+              <div class="muted">Быстрый просмотр основных таблиц PostgreSQL.</div>
             </div>
           </div>
-
-          <div class="panel">
+          <form class="toolbar" id="dbFilterForm">
+            <select class="form-select" id="dbTableSelect"></select>
+            <input class="form-control" id="dbClientFilter" placeholder="Фильтр по текущей странице">
+            <select class="form-select compact-control" id="dbPageSize">
+              <option value="25">25</option>
+              <option value="50" selected>50</option>
+              <option value="100">100</option>
+            </select>
+            <button class="btn btn-primary" type="submit">Открыть</button>
+          </form>
+          <section class="panel">
             <div class="table-responsive db-table-wrap">
               <table class="table table-sm table-hover align-middle mb-0" id="dbTable"></table>
             </div>
-          </div>
+            <div class="pagination-bar" id="dbPagination"></div>
+          </section>
         </section>
 
         <section class="page-section" id="page-test">
-          <div class="row g-3">
-            <div class="col-lg-5">
-              <div class="panel">
-                <div class="panel-header">Тестовое сообщение</div>
-                <div class="mb-3">
-                  <label class="form-label" for="testDisplayName">Имя</label>
-                  <input class="form-control" id="testDisplayName" value="Анна">
-                </div>
-                <div class="mb-3">
-                  <label class="form-label" for="testMessageText">Сообщение</label>
-                  <textarea class="form-control" id="testMessageText" rows="5">Здравствуйте, болит зуб, хочу записаться завтра в 15:00</textarea>
-                </div>
+          <div class="test-grid">
+            <section class="panel">
+              <div class="panel-title">Тестовое сообщение</div>
+              <div class="p-3">
+                <label class="form-label" for="testDisplayName">Имя</label>
+                <input class="form-control mb-3" id="testDisplayName" value="Анна">
+                <label class="form-label" for="testMessageText">Сообщение</label>
+                <textarea class="form-control mb-3" id="testMessageText" rows="5">Здравствуйте, болит зуб, хочу записаться завтра в 15:00</textarea>
                 <button class="btn btn-primary" id="sendTestMessageButton" type="button">Отправить агенту</button>
               </div>
-            </div>
-            <div class="col-lg-7">
-              <div class="panel h-100">
-                <div class="panel-header">Ответ API</div>
-                <pre class="json-box mb-0" id="testResult">{}</pre>
-              </div>
-            </div>
+            </section>
+            <section class="panel">
+              <div class="panel-title">Ответ API</div>
+              <pre class="json-box" id="testResult">{}</pre>
+            </section>
           </div>
         </section>
       </main>

@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import Groq from "groq-sdk";
 import { config } from "./config.js";
 import { prisma } from "./db.js";
@@ -202,6 +203,142 @@ export async function queueBroadcast({ name, prompt, filters = {}, type = "broad
   });
 }
 
+export async function queueManualBroadcast({
+  contactIds = [],
+  message = "",
+  dryRun = true,
+  sendWindow = {},
+  allowHumanTakeover = false
+} = {}) {
+  const safeMessage = normalizeText(message);
+  const ids = [...new Set((Array.isArray(contactIds) ? contactIds : []).map((value) => String(value || "").trim()).filter(Boolean))];
+
+  if (!safeMessage) {
+    throw new Error("message is required");
+  }
+
+  if (!ids.length) {
+    throw new Error("contact_ids is required");
+  }
+
+  const numericIds = ids.map((value) => Number(value)).filter((value) => Number.isInteger(value) && value > 0);
+  const stringIds = ids.filter((value) => !numericIds.includes(Number(value)));
+  const contacts = await prisma.contact.findMany({
+    where: {
+      OR: [
+        numericIds.length ? { id: { in: numericIds } } : undefined,
+        stringIds.length ? { maxUserId: { in: stringIds } } : undefined
+      ].filter(Boolean)
+    },
+    include: {
+      conversations: {
+        orderBy: { lastMessageAt: "desc" },
+        take: 1,
+        include: { memory: true }
+      }
+    }
+  });
+
+  const recipients = contacts
+    .filter((contact) => contact.maxUserId)
+    .filter((contact) => allowHumanTakeover || !["human_takeover", "handoff_required"].includes(contact.conversations?.[0]?.status))
+    .map((contact) => {
+      const memory = contact.conversations?.[0]?.memory?.memory || {};
+      const recipient = buildRecipient(contact, null, memory);
+      return {
+        ...recipient,
+        conversation_status: contact.conversations?.[0]?.status || null,
+        preview: renderTemplateMessage(safeMessage, recipient, "manual_broadcast")
+      };
+    });
+
+  if (dryRun) {
+    return {
+      dry_run: true,
+      recipients_found: recipients.length,
+      recipients: recipients.map((recipient) => ({
+        contact_id: recipient.contact_id,
+        chat_id: recipient.chat_id,
+        display_name: recipient.display_name,
+        patient_name: recipient.patient_name,
+        conversation_status: recipient.conversation_status,
+        preview: recipient.preview
+      }))
+    };
+  }
+
+  const scheduledAt = nextAllowedSendAt(sendWindow);
+  const campaign = await prisma.broadcastCampaign.create({
+    data: {
+      name: `Manual broadcast ${new Date().toISOString().slice(0, 10)}`,
+      prompt: safeMessage,
+      filters: {
+        contact_ids: ids,
+        send_window: normalizeSendWindow(sendWindow),
+        allow_human_takeover: allowHumanTakeover
+      },
+      type: "manual_broadcast",
+      status: "queued",
+      recipientsCount: recipients.length,
+      startedAt: new Date()
+    }
+  });
+
+  const hash = crypto.createHash("sha1").update(safeMessage).digest("hex").slice(0, 16);
+  const created = [];
+  const skipped = [];
+
+  for (const recipient of recipients) {
+    try {
+      const row = await prisma.outboundMessageQueue.create({
+        data: {
+          campaignId: campaign.id,
+          contactId: recipient.contact_id,
+          chatId: recipient.chat_id,
+          chatName: recipient.display_name || null,
+          recipientName: recipient.patient_name || recipient.display_name || null,
+          type: "manual_broadcast",
+          priority: 80,
+          dedupeKey: `manual:${hash}:${recipient.contact_id}`,
+          prompt: safeMessage,
+          messageText: recipient.preview,
+          status: "queued",
+          scheduledAt,
+          rawPayload: {
+            ...recipient,
+            event: "manual_broadcast_created"
+          }
+        }
+      });
+      created.push(row);
+    } catch (error) {
+      if (error.code === "P2002") {
+        skipped.push({ recipient, reason: "dedupe" });
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  await prisma.broadcastCampaign.update({
+    where: { id: campaign.id },
+    data: {
+      recipientsCount: created.length,
+      status: created.length ? "queued" : "empty"
+    }
+  });
+
+  return {
+    dry_run: false,
+    campaign_id: campaign.id,
+    recipients_found: recipients.length,
+    queued: created.length,
+    skipped: skipped.length,
+    scheduled_at: scheduledAt.toISOString(),
+    events: [{ type: "manual_broadcast_created", campaign_id: campaign.id, queued: created.length }]
+  };
+}
+
 export async function queueAnnualHygieneBroadcast({ prompt = defaultAnnualHygienePrompt, limit = 200, useAi = false } = {}) {
   const recipients = await getAnnualHygieneRecipients({ limit });
   return createCampaignWithMessages({
@@ -215,18 +352,71 @@ export async function queueAnnualHygieneBroadcast({ prompt = defaultAnnualHygien
   });
 }
 
-export async function getOutboundQueue({ status = "", limit = 100 } = {}) {
-  const where = normalizeText(status) ? { status: normalizeText(status) } : {};
-  const [items, grouped] = await Promise.all([
+function normalizeSendWindow(sendWindow = {}) {
+  return {
+    start: normalizeTime(sendWindow.start || sendWindow.start_time || config.reminderSendWindowStart || "09:00") || "09:00",
+    end: normalizeTime(sendWindow.end || sendWindow.end_time || config.reminderSendWindowEnd || "21:00") || "21:00"
+  };
+}
+
+function normalizeTime(value = "") {
+  const match = String(value || "").trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return null;
+  const hours = Math.min(23, Math.max(0, Number(match[1])));
+  const minutes = Math.min(59, Math.max(0, Number(match[2])));
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+}
+
+function nextAllowedSendAt(sendWindow = {}) {
+  const window = normalizeSendWindow(sendWindow);
+  const now = new Date();
+  const start = dateAtTime(now, window.start);
+  const end = dateAtTime(now, window.end);
+
+  if (now < start) return start;
+  if (now <= end) return now;
+
+  const tomorrow = addDays(now, 1);
+  return dateAtTime(tomorrow, window.start);
+}
+
+function dateAtTime(date, time) {
+  const [hours, minutes] = String(time || "09:00").split(":").map(Number);
+  const next = new Date(date);
+  next.setHours(hours || 0, minutes || 0, 0, 0);
+  return next;
+}
+
+export async function getOutboundQueue({ status = "", type = "", search = "", page = 1, pageSize = 50, limit = null } = {}) {
+  const currentPage = Math.max(1, Number(page || 1));
+  const take = toLimit(pageSize || limit, 50);
+  const text = normalizeText(search);
+  const where = {
+    ...(normalizeText(status) ? { status: normalizeText(status) } : {}),
+    ...(normalizeText(type) ? { type: normalizeText(type) } : {}),
+    ...(text
+      ? {
+          OR: [
+            { chatName: { contains: text, mode: "insensitive" } },
+            { recipientName: { contains: text, mode: "insensitive" } },
+            { chatId: { contains: text, mode: "insensitive" } },
+            { messageText: { contains: text, mode: "insensitive" } }
+          ]
+        }
+      : {})
+  };
+  const [items, total, grouped] = await Promise.all([
     prisma.outboundMessageQueue.findMany({
       where,
       orderBy: [{ scheduledAt: "desc" }, { id: "desc" }],
-      take: toLimit(limit, 100),
+      skip: (currentPage - 1) * take,
+      take,
       include: {
         contact: true,
         campaign: true
       }
     }),
+    prisma.outboundMessageQueue.count({ where }),
     prisma.outboundMessageQueue.groupBy({
       by: ["status"],
       _count: { _all: true }
@@ -235,6 +425,14 @@ export async function getOutboundQueue({ status = "", limit = 100 } = {}) {
 
   return {
     items,
+    pagination: {
+      page: currentPage,
+      page_size: take,
+      total,
+      total_pages: Math.max(Math.ceil(total / take), 1),
+      has_prev: currentPage > 1,
+      has_next: currentPage * take < total
+    },
     stats: Object.fromEntries(grouped.map((row) => [row.status, row._count._all]))
   };
 }

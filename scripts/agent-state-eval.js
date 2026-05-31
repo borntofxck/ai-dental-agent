@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import {
   avoidRepeatedBotReply,
   buildSafeScriptedReply,
+  classifyConversationRisk,
   detectComplaintOrAbuse,
   detectConversationIntent,
   detectNoiseMessage,
+  isConversationInHumanTakeover,
+  validateRequestedTimeAgainstWorkingHours,
   validateAppointmentCreation
 } from "../agent-api/src/messageService.js";
 import {
@@ -108,5 +111,71 @@ assert.equal(isHumanizedReplyAllowed({
   action: "cancel_appointment",
   state: "cancellation_requested"
 }), false, "humanizer must not turn cancel into booking");
+
+const simplePriceQuestion = classifyConversationRisk({ userMessage: "сколько стоит консультация?" });
+assert.equal(simplePriceQuestion.should_handoff, false, "simple price question must not handoff");
+assert.equal(simplePriceQuestion.risk_type, "none");
+
+const priceObjection = classifyConversationRisk({ userMessage: "почему так дорого, у других дешевле" });
+assert.equal(priceObjection.risk_type, "price_objection", "price objection must be classified");
+assert.equal(priceObjection.should_handoff, false, "first price objection should be handled softly");
+
+const repeatedPriceObjection = classifyConversationRisk({
+  userMessage: "ну дорого же",
+  context: {
+    recentMessages: [
+      { direction: "incoming", text: "почему так дорого" }
+    ]
+  }
+});
+assert.equal(repeatedPriceObjection.should_handoff, true, "repeated price objection must reach handoff threshold");
+
+const reviewThreat = classifyConversationRisk({ userMessage: "напишу плохой отзыв в 2гис" });
+assert.equal(reviewThreat.risk_type, "bad_review_threat");
+assert.equal(reviewThreat.should_handoff, true);
+
+const legalThreat = classifyConversationRisk({ userMessage: "я пойду в суд и напишу жалобу" });
+assert.equal(legalThreat.risk_type, "legal_threat");
+assert.equal(legalThreat.should_handoff, true);
+
+const angryComplaint = classifyConversationRisk({ userMessage: "вы что ебанулись почему записали меня" });
+assert.equal(angryComplaint.should_handoff, true);
+
+const fiveAm = validateRequestedTimeAgainstWorkingHours({
+  date: "2026-05-25",
+  time: "05:00"
+});
+assert.equal(fiveAm.valid, false, "5am appointment must be blocked");
+assert.equal(fiveAm.reason, "outside_working_hours");
+
+const sunday = validateRequestedTimeAgainstWorkingHours({
+  date: "2026-05-31",
+  time: "12:00"
+});
+assert.equal(sunday.valid, false, "Sunday appointment must be blocked by default");
+assert.equal(sunday.reason, "clinic_closed");
+
+const validHours = validateRequestedTimeAgainstWorkingHours({
+  date: "2026-05-25",
+  time: "12:00"
+});
+assert.equal(validHours.valid, true, "working hours appointment must pass");
+
+const blockedByHours = validateAppointmentCreation(
+  { action: "create_appointment" },
+  { consent_to_book: true, patient_name: "Анна", complaint: "гигиена", preferred_date: "2026-05-25", preferred_time: "05:00" },
+  {
+    bookingIntent: true,
+    messageText: "да запишите на 5 утра",
+    missingFields: [],
+    workingHoursValidation: fiveAm
+  }
+);
+assert.equal(blockedByHours.allowed, false);
+assert.equal(blockedByHours.reason, "outside_working_hours");
+
+assert.equal(isConversationInHumanTakeover({ status: "human_takeover" }), true);
+assert.equal(isConversationInHumanTakeover({ status: "handoff_required" }), true);
+assert.equal(isConversationInHumanTakeover({ status: "active" }), false);
 
 console.log("agent state eval passed");

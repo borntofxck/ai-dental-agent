@@ -112,11 +112,43 @@ When enough booking data is collected, it also creates or updates an `appointmen
 Production reply safety:
 
 ```text
-The LLM is asked for strict structured output: reply, intent, action, should_handoff, urgency and memory_patch.
+The runtime pipeline is token-optimized: a short LLM classifier reads only compact context and returns intent/action JSON.
+LLM is the semantic dialogue brain: it understands live Russian, typos, context and emotion, then proposes structured intent/action.
+Application code is the validator/executor: it validates AgentOutput, applies hard safety guards, checks state/action rules, blocks unsafe actions and logs decisions.
+Regex checks are not the main administrator logic. They are kept only as hard safety guards for destructive or risky cases.
 Only reply is allowed to leave Agent API and be sent to MAX.
 Sanitizers block JSON, reasoning, action/memory/status/tool text and other internal artifacts before sending.
-Sanitizers do not decide dialogue from the user's text. Rude/noisy/complaint messages are handled by the state/action guard layer first.
+Sanitizers do not decide dialogue from the user's text. Rude/noisy/complaint messages are handled by the state/action guard layer after LLM classification.
+Conversation risk is classified separately: price objection, aggression, bad review threat, reputation risk, discount request, medical risk, wrong booking complaint and legal threat.
 Duplicate protection uses external_message_id, per-conversation locks, recent reply debounce and repeated incoming text checks.
+```
+
+Token/runtime model routing:
+
+```text
+prompts/intent_classifier_runtime_prompt.md is the small runtime classifier prompt.
+prompts/dental_admin_system_prompt.md and prompts/clinic_knowledge.md are not loaded by the classifier on every message.
+buildCompactLLMContext keeps only short memory, active appointment/draft, clinic summary and MAX_LAST_MESSAGES recent messages.
+The classifier logs llm_usage, classifier_model_used, context_truncated and llm_prompt_too_large events.
+If Groq returns 429/TPD/TPM rate limits, the agent does not say "I did not understand"; it creates a handoff-style reply for an administrator.
+Humanizer is optional and selective. It is skipped for simple greetings, thanks, collect-name/phone/time and routine confirmations.
+```
+
+Useful env:
+
+```env
+CLASSIFIER_MODEL=llama-3.1-8b-instant
+HUMANIZER_MODEL=llama-3.1-8b-instant
+COMPLEX_MODEL=llama-3.3-70b-versatile
+COMPLEX_MODEL_ENABLED=true
+HUMANIZER_ENABLED=true
+HUMANIZER_ONLY_FOR_COMPLEX=true
+HUMANIZER_SKIP_SIMPLE=true
+MAX_CLASSIFIER_INPUT_TOKENS=2000
+MAX_HUMANIZER_INPUT_TOKENS=800
+MAX_LAST_MESSAGES=6
+MAX_MEMORY_CHARS=1000
+MAX_CONTEXT_CHARS=4000
 ```
 
 Appointment confirmation gate:
@@ -125,6 +157,7 @@ Appointment confirmation gate:
 Questions about doctors, prices, consultation cost or "when can I come" are treated as information requests.
 The backend does not create appointments from model output alone.
 create_appointment is allowed only after explicit user confirmation plus required booking data: reason/service, date, time and patient contact details.
+Requested appointment time is validated against clinic working hours before create_appointment/check_slot logic.
 If the gate is not passed, appointment_requests, appointment_slots and appointment_reminders are not created.
 If the model proposes create_appointment too early, code downgrades the action, logs the event and asks for the missing detail instead.
 Fallback responses are emergency-only: LLM failure, invalid JSON, empty answer or unsafe reply.
@@ -135,7 +168,7 @@ State/action guards:
 ```text
 Conversation state is tracked in memory: idle, answering_question, collecting_booking_data,
 waiting_booking_confirmation, appointment_booked, cancellation_requested, reschedule_requested,
-handoff_required.
+handoff_required, human_takeover.
 Cancel intent has priority over booking and reschedule. Messages like "отменить", "удалите",
 "не надо", "денег нет", "зачем вы меня записали" clear pending booking data, cancel pending
 reminders and block create_appointment. Angry wrong-booking complaints create a handoff.
@@ -143,6 +176,17 @@ Dental service disambiguation runs before cancel validation: "удалить з�
 "вырвать зуб" and similar phrases are treated as tooth_extraction / wisdom_tooth_extraction,
 not as appointment cancellation. Only explicit references to запись, прием, визит or бронь can
 trigger cancel_appointment.
+```
+
+Risk handoff and AI OFF:
+
+```text
+High-risk conversations create a handoff and set conversation.status = human_takeover.
+While a conversation is in human_takeover / handoff_required, incoming messages are saved but AI does not answer.
+Resolving a handoff in the admin API returns the conversation to active AI mode.
+Configurable rules live in HANDOFF_RULES_JSON. Defaults hand off on aggression, bad review threats, legal threats,
+reputation risk, medical risk, wrong-booking complaints and repeated price objections.
+Working hours can be customized with WORKING_HOURS_JSON. Default: Mon-Sat 09:00-20:00, Sunday closed.
 ```
 
 Safe reply pipeline:
@@ -172,6 +216,9 @@ Safety eval:
 npm run agent:safety-test
 npm run agent:pipeline-test
 npm run agent:state-test
+npm run agent:intent-test
+npm run agent:token-test
+npm run booking:test
 ```
 
 Slot protection:
@@ -188,6 +235,23 @@ GET  http://localhost:3002/reminders/due
 POST http://localhost:3002/reminders/:id/sent
 POST http://localhost:3002/reminders/:id/failed
 ```
+
+Manual broadcast endpoint:
+
+```text
+POST http://localhost:3002/api/admin/broadcast/manual
+```
+
+```json
+{
+  "contact_ids": ["1", "2"],
+  "message": "Здравствуйте, {{name}}! Напоминаем про акцию клиники.",
+  "dry_run": true,
+  "send_window": { "start": "09:00", "end": "21:00" }
+}
+```
+
+`dry_run: true` returns recipients and previews without queue writes. `dry_run: false` creates `manual_broadcast` rows in `outbound_message_queue`. Human-takeover chats are skipped unless `allow_human_takeover: true` is passed.
 
 ## MAX Adapter
 

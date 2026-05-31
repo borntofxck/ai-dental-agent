@@ -7,7 +7,8 @@ import {
   getBroadcastRecipients,
   getOutboundQueue,
   queueAnnualHygieneBroadcast,
-  queueBroadcast
+  queueBroadcast,
+  queueManualBroadcast
 } from "./broadcastService.js";
 
 const systemPromptPath = new URL("../../prompts/dental_admin_system_prompt.md", import.meta.url);
@@ -52,6 +53,35 @@ function toLimit(value, fallback = 50) {
   const number = Number(value || fallback);
   if (!Number.isFinite(number)) return fallback;
   return Math.min(Math.max(Math.trunc(number), 1), 200);
+}
+
+function toPage(value) {
+  const number = Number(value || 1);
+  if (!Number.isFinite(number)) return 1;
+  return Math.max(Math.trunc(number), 1);
+}
+
+function toPageSize(value, fallback = 50, max = 200) {
+  const number = Number(value || fallback);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(Math.max(Math.trunc(number), 1), max);
+}
+
+function pagination(page, pageSize, total) {
+  return {
+    page,
+    page_size: pageSize,
+    total,
+    total_pages: Math.max(Math.ceil(total / pageSize), 1),
+    has_prev: page > 1,
+    has_next: page * pageSize < total
+  };
+}
+
+function parseDate(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
 }
 
 function normalizeStatus(value) {
@@ -145,39 +175,48 @@ export function createAdminRouter() {
 
   router.get("/conversations", async (req, res) => {
     const search = String(req.query.search || "").trim();
-    const limit = toLimit(req.query.limit, 60);
-    const where = search
-      ? {
-          OR: [
-            { contact: { displayName: { contains: search, mode: "insensitive" } } },
-            { contact: { maxUserId: { contains: search, mode: "insensitive" } } },
-            { messages: { some: { text: { contains: search, mode: "insensitive" } } } }
-          ]
-        }
-      : {};
+    const status = normalizeStatus(req.query.status);
+    const page = toPage(req.query.page);
+    const pageSize = toPageSize(req.query.page_size || req.query.limit, 30, 100);
+    const where = {
+      ...(status ? { status } : {}),
+      ...(search
+        ? {
+            OR: [
+              { contact: { displayName: { contains: search, mode: "insensitive" } } },
+              { contact: { maxUserId: { contains: search, mode: "insensitive" } } },
+              { messages: { some: { text: { contains: search, mode: "insensitive" } } } }
+            ]
+          }
+        : {})
+    };
 
-    const conversations = await prisma.conversation.findMany({
-      where,
-      orderBy: [{ lastMessageAt: "desc" }, { id: "desc" }],
-      take: limit,
-      include: {
-        contact: true,
-        memory: true,
-        messages: {
-          orderBy: { createdAt: "desc" },
-          take: 1
-        },
-        _count: {
-          select: {
-            messages: true,
-            appointments: true,
-            handoffs: true
+    const [total, conversations] = await Promise.all([
+      prisma.conversation.count({ where }),
+      prisma.conversation.findMany({
+        where,
+        orderBy: [{ lastMessageAt: "desc" }, { id: "desc" }],
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+        include: {
+          contact: true,
+          memory: true,
+          messages: {
+            orderBy: { createdAt: "desc" },
+            take: 1
+          },
+          _count: {
+            select: {
+              messages: true,
+              appointments: true,
+              handoffs: true
+            }
           }
         }
-      }
-    });
+      })
+    ]);
 
-    res.json({ conversations });
+    res.json({ conversations, pagination: pagination(page, pageSize, total) });
   });
 
   router.get("/conversations/:id", async (req, res) => {
@@ -219,21 +258,54 @@ export function createAdminRouter() {
 
   router.get("/appointments", async (req, res) => {
     const status = normalizeStatus(req.query.status);
-    const appointments = await prisma.appointmentRequest.findMany({
-      where: status ? { status } : {},
-      orderBy: { createdAt: "desc" },
-      take: toLimit(req.query.limit, 100),
-      include: {
-        contact: true,
-        conversation: true,
-        slot: true,
-        reminders: {
-          orderBy: { remindAt: "asc" }
-        }
-      }
-    });
+    const search = String(req.query.search || "").trim();
+    const dateFrom = parseDate(req.query.date_from);
+    const dateTo = parseDate(req.query.date_to);
+    const page = toPage(req.query.page);
+    const pageSize = toPageSize(req.query.page_size || req.query.limit, 30, 100);
+    const where = {
+      ...(status ? { status } : {}),
+      ...(dateFrom || dateTo
+        ? {
+            preferredDate: {
+              ...(dateFrom ? { gte: dateFrom } : {}),
+              ...(dateTo ? { lte: dateTo } : {})
+            }
+          }
+        : {}),
+      ...(search
+        ? {
+            OR: [
+              { patientName: { contains: search, mode: "insensitive" } },
+              { phone: { contains: search, mode: "insensitive" } },
+              { complaint: { contains: search, mode: "insensitive" } },
+              { requestedService: { contains: search, mode: "insensitive" } },
+              { contact: { displayName: { contains: search, mode: "insensitive" } } },
+              { contact: { maxUserId: { contains: search, mode: "insensitive" } } }
+            ]
+          }
+        : {})
+    };
 
-    res.json({ appointments });
+    const [total, appointments] = await Promise.all([
+      prisma.appointmentRequest.count({ where }),
+      prisma.appointmentRequest.findMany({
+        where,
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+        include: {
+          contact: true,
+          conversation: true,
+          slot: true,
+          reminders: {
+            orderBy: { remindAt: "asc" }
+          }
+        }
+      })
+    ]);
+
+    res.json({ appointments, pagination: pagination(page, pageSize, total) });
   });
 
   router.patch("/appointments/:id/status", async (req, res) => {
@@ -256,31 +328,43 @@ export function createAdminRouter() {
 
   router.get("/reminders", async (req, res) => {
     const status = normalizeStatus(req.query.status);
-    const reminders = await prisma.appointmentReminder.findMany({
-      where: status ? { status } : {},
-      orderBy: { remindAt: "asc" },
-      take: toLimit(req.query.limit, 100),
-      include: {
-        contact: true,
-        appointmentRequest: true
-      }
-    });
+    const page = toPage(req.query.page);
+    const pageSize = toPageSize(req.query.page_size || req.query.limit, 30, 100);
+    const where = status ? { status } : {};
+    const [total, reminders] = await Promise.all([
+      prisma.appointmentReminder.count({ where }),
+      prisma.appointmentReminder.findMany({
+        where,
+        orderBy: [{ remindAt: "asc" }, { id: "desc" }],
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+        include: {
+          contact: true,
+          appointmentRequest: true
+        }
+      })
+    ]);
 
-    res.json({ reminders });
+    res.json({ reminders, pagination: pagination(page, pageSize, total) });
   });
 
   router.get("/broadcast/recipients", async (req, res) => {
+    const page = toPage(req.query.page);
+    const pageSize = toPageSize(req.query.page_size || req.query.limit, 25, 100);
+    const fetchLimit = 1000;
     const recipients = req.query.annual_hygiene === "true"
-      ? await getAnnualHygieneRecipients({ limit: req.query.limit })
+      ? await getAnnualHygieneRecipients({ limit: fetchLimit })
       : await getBroadcastRecipients({
           serviceQuery: req.query.service_query,
           visitedBeforeDays: req.query.visited_before_days,
           visitedAfterDays: req.query.visited_after_days,
           onlyWithVisits: req.query.only_with_visits === "true",
-          limit: req.query.limit
+          limit: fetchLimit
         });
+    const total = recipients.length;
+    const pageItems = recipients.slice((page - 1) * pageSize, page * pageSize);
 
-    res.json({ recipients, count: recipients.length });
+    res.json({ recipients: pageItems, count: total, pagination: pagination(page, pageSize, total) });
   });
 
   router.post("/broadcast", async (req, res) => {
@@ -301,10 +385,29 @@ export function createAdminRouter() {
     res.json({ ok: true, ...result });
   });
 
+  router.post("/broadcast/manual", async (req, res) => {
+    try {
+      const result = await queueManualBroadcast({
+        contactIds: req.body?.contact_ids || req.body?.contactIds || [],
+        message: req.body?.message,
+        dryRun: req.body?.dry_run !== false,
+        sendWindow: req.body?.send_window || {},
+        allowHumanTakeover: Boolean(req.body?.allow_human_takeover)
+      });
+
+      res.json({ ok: true, ...result });
+    } catch (error) {
+      res.status(400).json({ ok: false, error: error.message });
+    }
+  });
+
   router.get("/broadcast/outbound-queue", async (req, res) => {
     res.json(await getOutboundQueue({
       status: req.query.status,
-      limit: req.query.limit
+      type: req.query.type,
+      search: req.query.search,
+      page: req.query.page,
+      pageSize: req.query.page_size || req.query.limit
     }));
   });
 
@@ -314,6 +417,13 @@ export function createAdminRouter() {
       data: {
         status: "resolved",
         resolvedAt: new Date()
+      }
+    });
+    await prisma.conversation.update({
+      where: { id: handoff.conversationId },
+      data: {
+        status: "active",
+        updatedAt: new Date()
       }
     });
 
@@ -366,12 +476,18 @@ export function createAdminRouter() {
       return;
     }
 
-    const rows = await model.findMany({
-      orderBy: { id: "desc" },
-      take: toLimit(req.query.limit, 100)
-    });
+    const page = toPage(req.query.page);
+    const pageSize = toPageSize(req.query.page_size || req.query.limit, 50, 200);
+    const [total, rows] = await Promise.all([
+      model.count(),
+      model.findMany({
+        orderBy: { id: "desc" },
+        skip: (page - 1) * pageSize,
+        take: pageSize
+      })
+    ]);
 
-    res.json({ table, rows });
+    res.json({ table, rows, pagination: pagination(page, pageSize, total) });
   });
 
   router.get("/report/today", async (req, res) => {

@@ -40,6 +40,18 @@ const allowedActions = new Set([
 ]);
 
 const allowedUrgency = new Set(["low", "medium", "high"]);
+const allowedRiskLevels = new Set(["low", "medium", "high"]);
+const allowedRiskTypes = new Set([
+  "none",
+  "price_objection",
+  "aggression",
+  "bad_review_threat",
+  "reputation_risk",
+  "discount_request",
+  "medical_risk",
+  "wrong_booking_complaint",
+  "legal_threat"
+]);
 
 const legacyUrgencyMap = {
   normal: "medium",
@@ -103,6 +115,7 @@ export function normalizeStructuredAgentOutput(raw, userMessage = "") {
     should_handoff: Boolean(parsed.should_handoff),
     handoff_reason: parsed.handoff_reason || null,
     urgency,
+    risk: normalizeRisk(parsed.risk || {}),
     memory_patch: memoryPatch,
     pipeline_events: Array.isArray(parsed.pipeline_events) ? parsed.pipeline_events : [],
     // Backward-compatible fields used by the current booking workflow.
@@ -215,6 +228,19 @@ function normalizeUrgency(value) {
   const raw = String(value || "low").trim();
   const mapped = legacyUrgencyMap[raw] || raw;
   return allowedUrgency.has(mapped) ? mapped : "low";
+}
+
+function normalizeRisk(value = {}) {
+  const risk = value && typeof value === "object" ? value : {};
+  const riskLevel = String(risk.risk_level || "low").trim();
+  const riskType = String(risk.risk_type || "none").trim();
+
+  return {
+    risk_level: allowedRiskLevels.has(riskLevel) ? riskLevel : "low",
+    risk_type: allowedRiskTypes.has(riskType) ? riskType : "none",
+    should_handoff: Boolean(risk.should_handoff),
+    reason: cleanPatchValue(risk.reason)
+  };
 }
 
 function normalizeMemoryPatch(value = {}) {

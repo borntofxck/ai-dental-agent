@@ -1,4 +1,4 @@
-import { generateAgentResponse, humanizeReplyWithAI } from "./agent.js";
+import { classifyUserIntentWithLLM, humanizeReplyWithAI } from "./agent.js";
 import crypto from "node:crypto";
 import {
   buildClinicDateTime as buildParsedClinicDateTime,
@@ -11,6 +11,7 @@ import {
   normalizeBookingMemory,
   toIsoDate as toBookingIsoDate
 } from "./bookingParser.js";
+import { config } from "./config.js";
 import { prisma } from "./db.js";
 import { sanitizeReplyForUser } from "./replySanitizer.js";
 
@@ -26,6 +27,7 @@ const CONVERSATION_STATES = new Set([
   "appointment_booked",
   "cancellation_requested",
   "reschedule_requested",
+  "human_takeover",
   "handoff_required"
 ]);
 
@@ -84,7 +86,7 @@ async function findOrCreateConversation(contactId, channel) {
     where: {
       contactId,
       channel,
-      status: "active"
+      status: { in: ["active", "human_takeover", "handoff_required"] }
     },
     orderBy: { createdAt: "desc" }
   });
@@ -97,6 +99,34 @@ async function findOrCreateConversation(contactId, channel) {
       channel,
       status: "active",
       lastMessageAt: new Date()
+    }
+  });
+}
+
+export function isConversationInHumanTakeover(conversation = {}) {
+  return ["human_takeover", "handoff_required"].includes(conversation?.status);
+}
+
+export async function takeOverConversation({ conversationId, reason = "handoff_required" } = {}) {
+  if (!conversationId) return null;
+
+  return prisma.conversation.update({
+    where: { id: conversationId },
+    data: {
+      status: "human_takeover",
+      updatedAt: new Date()
+    }
+  });
+}
+
+export async function returnConversationToAI({ conversationId } = {}) {
+  if (!conversationId) return null;
+
+  return prisma.conversation.update({
+    where: { id: conversationId },
+    data: {
+      status: "active",
+      updatedAt: new Date()
     }
   });
 }
@@ -323,6 +353,37 @@ export async function processIncomingMessage(input) {
     }
   });
 
+  if (isConversationInHumanTakeover(conversation)) {
+    const events = [
+      {
+        type: "ai_disabled_after_handoff",
+        reason: "conversation_in_human_takeover"
+      }
+    ];
+
+    await prisma.agentAction.create({
+      data: {
+        conversationId: conversation.id,
+        actionType: "ai_skipped_human_takeover",
+        reason: "conversation_in_human_takeover",
+        payload: {
+          incoming_message_id: incomingMessage.id,
+          events
+        }
+      }
+    });
+    await logPipelineEvents({ conversationId: conversation.id, events });
+
+    return {
+      reply: null,
+      skipped: true,
+      reason: "human_takeover",
+      contact_id: contact.id,
+      conversation_id: conversation.id,
+      incoming_message_id: incomingMessage.id
+    };
+  }
+
   const memoryRow = await prisma.conversationMemory.findUnique({
     where: { conversationId: conversation.id }
   });
@@ -343,95 +404,83 @@ export async function processIncomingMessage(input) {
   let baseMemory = activeAppointment
     ? memoryRow?.memory || {}
     : clearStaleBookingMemory(memoryRow?.memory || {});
-  const conversationIntent = detectConversationIntent(messageText);
+  const hardGuardIntent = detectConversationIntent(messageText);
 
   if (
     !activeAppointment &&
     baseMemory.status === "cancellation_requested" &&
-    conversationIntent.intent === "message" &&
+    hardGuardIntent.intent === "message" &&
     hasExplicitBookingRequest(messageText)
   ) {
     baseMemory = { ...clearAppointmentDraft(baseMemory), status: "collecting_booking_data" };
   }
 
-  if (conversationIntent.intent === "cancel") {
-    return await handleGuardedScriptedTurn({
-      contact,
-      conversation,
-      incomingMessage,
-      externalMessageId,
-      payload,
-      messageText,
-      baseMemory,
-      activeAppointment,
-      guard: conversationIntent
-    });
-  }
-
-  if (conversationIntent.intent === "reschedule") {
-    return await handleGuardedScriptedTurn({
-      contact,
-      conversation,
-      incomingMessage,
-      externalMessageId,
-      payload,
-      messageText,
-      baseMemory,
-      activeAppointment,
-      guard: conversationIntent
-    });
-  }
-
-  if (conversationIntent.intent === "abuse" || conversationIntent.intent === "noise") {
-    return await handleGuardedScriptedTurn({
-      contact,
-      conversation,
-      incomingMessage,
-      externalMessageId,
-      payload,
-      messageText,
-      baseMemory,
-      activeAppointment,
-      guard: conversationIntent
-    });
-  }
-
-  if (isGreetingOnly(messageText) && shouldUseContextualGreeting({ recentMessages, activeAppointment, memory: baseMemory })) {
-    const afterReminder = activeAppointment
-      ? await hasRecentSentReminder(activeAppointment.id)
-      : false;
-
-    return await handleGuardedScriptedTurn({
-      contact,
-      conversation,
-      incomingMessage,
-      externalMessageId,
-      payload,
-      messageText,
-      baseMemory,
-      activeAppointment,
-      guard: {
-        intent: "greeting",
-        action: "answer_question",
-        state: afterReminder ? "appointment_booked" : "idle",
-        shouldHandoff: false,
-        events: [{ type: "contextual_first_reply", reason: afterReminder ? "after_reminder" : "greeting_only" }],
-        afterReminder
-      }
-    });
-  }
-
-  const agentResult = await generateAgentResponse({
+  const agentResult = await classifyUserIntentWithLLM({
     userMessage: messageText,
     history: prepareHistoryForAgent(recentMessages, { activeAppointment }),
+    memory: baseMemory,
+    activeAppointment,
+    conversationState: baseMemory.status || (activeAppointment?.status === "confirmed" ? "appointment_booked" : "idle"),
+    bookingDraft: {
+      service: baseMemory.requested_service,
+      date: baseMemory.preferred_date,
+      time: baseMemory.preferred_time,
+      status: baseMemory.status
+    }
+  });
+  const riskAssessment = classifyConversationRisk({
+    userMessage: messageText,
+    agentOutput: agentResult,
+    context: {
+      recentMessages,
+      memory: baseMemory,
+      activeAppointment
+    }
+  });
+  const riskGuard = buildRiskGuard(riskAssessment);
+  if (riskGuard) {
+    return await handleGuardedScriptedTurn({
+      contact,
+      conversation,
+      incomingMessage,
+      externalMessageId,
+      payload,
+      messageText,
+      baseMemory,
+      activeAppointment,
+      guard: riskGuard
+    });
+  }
+  const conversationIntent = hardGuardIntent;
+  const guardedTurn = await buildPostClassifierGuard({
+    guard: hardGuardIntent,
+    agentResult,
+    messageText,
+    recentMessages,
+    activeAppointment,
     memory: baseMemory
   });
+
+  if (guardedTurn) {
+    return await handleGuardedScriptedTurn({
+      contact,
+      conversation,
+      incomingMessage,
+      externalMessageId,
+      payload,
+      messageText,
+      baseMemory,
+      activeAppointment,
+      guard: guardedTurn
+    });
+  }
   const deterministicFacts = extractBookingFacts(messageText);
   const explicitBookingConfirmation = hasExplicitBookingConfirmation(messageText);
   if (explicitBookingConfirmation) {
     deterministicFacts.consent_to_book = true;
   }
-  const currentMessageBookingSignal = hasExplicitBookingRequest(messageText) || isBookingIntent({
+  const classifierBookingSignal = isClassifierBookingSignal(agentResult);
+  const currentMessageBookingSignal = conversationIntent.intent === "booking_request" || classifierBookingSignal || hasExplicitBookingRequest(messageText) || isBookingIntent({
     text: messageText,
     memory: deterministicFacts
   });
@@ -442,6 +491,16 @@ export async function processIncomingMessage(input) {
     ...agentResult,
     memory_update: safeMemoryUpdate
   };
+  const pipelineEvents = [
+    ...(Array.isArray(agentResult.pipeline_events) ? agentResult.pipeline_events : []),
+    ...(Array.isArray(riskAssessment.events) ? riskAssessment.events : [])
+  ];
+  const preValidationSafetyOverride = applyHardSafetyOverrides({
+    agentResult: safeAgentResult,
+    guard: conversationIntent
+  });
+  Object.assign(safeAgentResult, preValidationSafetyOverride.agentResult);
+  pipelineEvents.push(...preValidationSafetyOverride.events);
 
   const nextMemory = normalizeBookingMemory(mergeMemory(
     baseMemory,
@@ -468,20 +527,26 @@ export async function processIncomingMessage(input) {
     ? buildPostBookingSocialReply({ messageText, appointmentRequest: activeAppointment, memory: nextMemory })
     : null;
   const missingBookingFields = getMissingAppointmentFields({ memory: nextMemory, payload });
+  const workingHoursValidation = validateRequestedTimeAgainstWorkingHours({
+    date: nextMemory.preferred_date,
+    time: nextMemory.preferred_time,
+    clinicConfig: config
+  });
+  if (bookingIntent) {
+    pipelineEvents.push(...(workingHoursValidation.events || []));
+  }
   const appointmentValidation = validateAppointmentCreation(safeAgentResult, nextMemory, {
     payload,
     messageText,
     bookingIntent,
     missingFields: missingBookingFields,
-    conversationState
+    conversationState,
+    workingHoursValidation
   });
   const responseMissingBookingFields = bookingIntent ? appointmentValidation.missing_fields : [];
   const shouldCreateAppointmentRequest = appointmentValidation.allowed;
   let appointmentRequest = null;
   let slotConflict = null;
-  const pipelineEvents = [
-    ...(Array.isArray(agentResult.pipeline_events) ? agentResult.pipeline_events : [])
-  ];
 
   if (bookingIntent && !appointmentValidation.allowed) {
     pipelineEvents.push({
@@ -522,20 +587,7 @@ export async function processIncomingMessage(input) {
     safeAgentResult.should_create_appointment_request = false;
   }
 
-  if (conversationIntent.intent === "booking_request" && isUnsafeDentalServiceAction(safeAgentResult)) {
-    pipelineEvents.push({
-      type: "unsafe_action_downgraded",
-      from: safeAgentResult.action || safeAgentResult.intent,
-      to: appointmentValidation.downgraded_action || "collect_datetime",
-      reason: "dental_service_not_cancel"
-    });
-    safeAgentResult.intent = "booking";
-    safeAgentResult.action = appointmentValidation.downgraded_action || "collect_datetime";
-    safeAgentResult.should_handoff = false;
-    safeAgentResult.handoff_reason = null;
-  }
-
-  if (!agentResult.should_handoff && shouldCreateAppointmentRequest) {
+  if (!safeAgentResult.should_handoff && shouldCreateAppointmentRequest) {
     const bookingResult = await upsertAppointmentRequest({
       conversationId: conversation.id,
       contactId: contact.id,
@@ -555,14 +607,20 @@ export async function processIncomingMessage(input) {
     slotConflict,
     activeAppointment,
     informationQuestion: isInformationQuestion(messageText),
-    agentResult
+    agentResult: safeAgentResult
   });
 
-  let finalReply = agentResult.reply;
+  let finalReply = safeAgentResult.reply;
   let replySource = "agent";
   if (postBookingSocialReply) {
     finalReply = postBookingSocialReply;
     replySource = "post_booking_social";
+  } else if (workingHoursValidation.valid === false && bookingIntent) {
+    finalReply = buildOutsideWorkingHoursReply({ validation: workingHoursValidation, memory: nextMemory, messageText });
+    replySource = "outside_working_hours";
+  } else if (riskAssessment.risk_type === "price_objection") {
+    finalReply = buildPriceObjectionReply({ messageText, memory: nextMemory, rounds: countRecentPriceObjections(recentMessages) + 1 });
+    replySource = "price_objection";
   } else if (conversationIntent.intent === "pricing_question") {
     finalReply = buildDentalServiceInfoReply({ service: conversationIntent.service, serviceCategory: conversationIntent.service_category, messageText });
     replySource = "dental_service_info";
@@ -575,16 +633,26 @@ export async function processIncomingMessage(input) {
   } else if (conversationIntent.intent === "booking_request" && bookingIntent && !appointmentValidation.allowed) {
     finalReply = buildBookingProgressReply({ memory: nextMemory, payload, missingFields: appointmentValidation.missing_fields, messageText });
     replySource = "booking_progress";
-  } else if (conversationIntent.intent === "booking_request" && isUnsafeDentalServiceReply(agentResult.reply)) {
+  } else if (conversationIntent.intent === "booking_request" && isUnsafeDentalServiceReply(safeAgentResult.reply)) {
     finalReply = buildBookingProgressReply({ memory: nextMemory, payload, missingFields: appointmentValidation.missing_fields, messageText });
     replySource = "booking_progress";
   } else if (bookingIntent && shouldUseWorkflowProgressReply({
-    agentReply: agentResult.reply,
+    agentReply: safeAgentResult.reply,
     missingFields: appointmentValidation.missing_fields,
     messageText
   })) {
     finalReply = buildBookingProgressReply({ memory: nextMemory, payload, missingFields: appointmentValidation.missing_fields, messageText });
     replySource = "booking_progress";
+  } else if (!String(finalReply || "").trim()) {
+    finalReply = buildClassifierGuidedReply({
+      agentResult: safeAgentResult,
+      memory: nextMemory,
+      payload,
+      messageText,
+      appointmentValidation,
+      bookingIntent
+    });
+    replySource = "reply_builder";
   }
   finalReply = sanitizeStaleBookingReply({
     reply: finalReply,
@@ -637,11 +705,13 @@ export async function processIncomingMessage(input) {
       role: "assistant",
       text: finalReply,
       rawPayload: {
-        ...agentResult,
+        ...safeAgentResult,
         memory_update: safeAgentResult.memory_update,
         reply: finalReply,
         deterministic_facts: deterministicFacts,
+        risk: riskAssessment,
         appointment_validation: appointmentValidation,
+        working_hours_validation: workingHoursValidation,
         pipeline_events: pipelineEvents,
         booking_intent: bookingIntent,
         missing_booking_fields: responseMissingBookingFields,
@@ -666,11 +736,13 @@ export async function processIncomingMessage(input) {
   await prisma.agentAction.create({
     data: {
       conversationId: conversation.id,
-      actionType: safeAgentResult.action || (agentResult.should_handoff ? "handoff" : "answer"),
-      reason: agentResult.handoff_reason || agentResult.intent || null,
+      actionType: safeAgentResult.action || (safeAgentResult.should_handoff ? "handoff" : "answer"),
+      reason: safeAgentResult.handoff_reason || safeAgentResult.intent || null,
       payload: {
         ...safeAgentResult,
+        risk: riskAssessment,
         appointment_validation: appointmentValidation,
+        working_hours_validation: workingHoursValidation,
         pipeline_events: pipelineEvents
       }
     }
@@ -678,22 +750,26 @@ export async function processIncomingMessage(input) {
 
   await logPipelineEvents({ conversationId: conversation.id, events: pipelineEvents });
 
-  if (agentResult.should_handoff) {
+  if (safeAgentResult.should_handoff) {
     await prisma.handoff.create({
       data: {
         conversationId: conversation.id,
         contactId: contact.id,
-        reason: agentResult.handoff_reason || "agent_requested_handoff",
+        reason: safeAgentResult.handoff_reason || "agent_requested_handoff",
         status: "open"
       }
+    });
+    await takeOverConversation({
+      conversationId: conversation.id,
+      reason: safeAgentResult.handoff_reason || "agent_requested_handoff"
     });
   }
 
   return {
     reply: finalReply,
-    intent: bookingIntent ? "book_appointment" : agentResult.intent,
-    urgency: agentResult.urgency,
-    should_handoff: agentResult.should_handoff,
+    intent: bookingIntent ? "book_appointment" : safeAgentResult.intent,
+    urgency: safeAgentResult.urgency,
+    should_handoff: safeAgentResult.should_handoff,
     should_create_appointment_request: shouldCreateAppointmentRequest && !slotConflict,
     slot_conflict: slotConflict,
     missing_booking_fields: responseMissingBookingFields,
@@ -707,6 +783,78 @@ export async function processIncomingMessage(input) {
   } finally {
     await releaseProcessingLock(lockKey, lock.lockToken);
   }
+}
+
+async function buildPostClassifierGuard({
+  guard,
+  agentResult = {},
+  messageText = "",
+  recentMessages = [],
+  activeAppointment = null,
+  memory = {}
+} = {}) {
+  const contextualGreeting = isGreetingOnly(messageText) && shouldUseContextualGreeting({ recentMessages, activeAppointment, memory });
+
+  if (!guard || (["message", "booking_request", "pricing_question"].includes(guard.intent) && !contextualGreeting)) {
+    return null;
+  }
+
+  const classifierSummary = summarizeAgentOutput(agentResult);
+
+  if (["cancel", "reschedule", "abuse", "noise"].includes(guard.intent)) {
+    return {
+      ...guard,
+      classifier_output: classifierSummary,
+      events: [
+        ...(guard.events || []),
+        {
+          type: "hard_safety_guard_applied",
+          guard_intent: guard.intent,
+          classifier_intent: agentResult.intent || null,
+          classifier_action: agentResult.action || null
+        }
+      ]
+    };
+  }
+
+  if (guard.intent === "greeting" || contextualGreeting) {
+    const afterReminder = activeAppointment
+      ? await hasRecentSentReminder(activeAppointment.id)
+      : false;
+
+    return {
+      intent: "greeting",
+      action: "answer_question",
+      state: afterReminder ? "appointment_booked" : "idle",
+      shouldHandoff: false,
+      classifier_output: classifierSummary,
+      events: [
+        { type: "contextual_first_reply", reason: afterReminder ? "after_reminder" : "greeting_only" },
+        {
+          type: "hard_safety_guard_applied",
+          guard_intent: "greeting",
+          classifier_intent: agentResult.intent || null,
+          classifier_action: agentResult.action || null
+        }
+      ],
+      afterReminder
+    };
+  }
+
+  return null;
+}
+
+function summarizeAgentOutput(agentResult = {}) {
+  return {
+    intent: agentResult.intent || null,
+    action: agentResult.action || null,
+    safe_next_action: agentResult.safe_next_action || null,
+    should_handoff: Boolean(agentResult.should_handoff),
+    handoff_reason: agentResult.handoff_reason || null,
+    urgency: agentResult.urgency || null,
+    extracted: agentResult.extracted || {},
+    memory_patch: agentResult.memory_patch || {}
+  };
 }
 
 async function handleGuardedScriptedTurn({
@@ -757,6 +905,14 @@ async function handleGuardedScriptedTurn({
     actionType = "handoff_to_admin";
     shouldHandoff = true;
     handoffReason = guard.reason || "abuse_or_complaint";
+  } else if (guard.intent === "handoff") {
+    nextMemory = {
+      ...clearAppointmentDraft(nextMemory),
+      status: "handoff_required"
+    };
+    actionType = "handoff_to_admin";
+    shouldHandoff = true;
+    handoffReason = guard.reason || guard.risk?.risk_type || "high_risk_conversation";
   } else if (guard.intent === "noise") {
     actionType = "none";
     pipelineEvents.push({ type: "noise_ignored_without_state_change", previous_status: nextMemory.status || null });
@@ -870,6 +1026,10 @@ async function handleGuardedScriptedTurn({
         reason: handoffReason || "guard_requested_handoff",
         status: "open"
       }
+    });
+    await takeOverConversation({
+      conversationId: conversation.id,
+      reason: handoffReason || "guard_requested_handoff"
     });
   }
 
@@ -1255,6 +1415,175 @@ export function detectConversationIntent(text = "") {
   };
 }
 
+export function classifyConversationRisk({ userMessage = "", agentOutput = {}, context = {} } = {}) {
+  const text = String(userMessage || "").toLowerCase();
+  const recentMessages = context.recentMessages || [];
+  const rules = config.handoffRules || {};
+  const events = [{ type: "risk_classified", source: "hard_guard" }];
+
+  const result = {
+    risk_level: "low",
+    risk_type: "none",
+    should_handoff: false,
+    reason: "no_risk",
+    events
+  };
+
+  const setRisk = ({ level, type, shouldHandoff, reason, event }) => {
+    result.risk_level = level;
+    result.risk_type = type;
+    result.should_handoff = Boolean(shouldHandoff);
+    result.reason = reason;
+    if (event) events.push(event);
+    return result;
+  };
+
+  if (detectWrongBookingComplaint(text)) {
+    return setRisk({
+      level: "high",
+      type: "wrong_booking_complaint",
+      shouldHandoff: rules.handoff_on_wrong_booking_complaint !== false,
+      reason: "wrong_booking_complaint",
+      event: { type: "wrong_booking_complaint_detected" }
+    });
+  }
+
+  if (detectLegalThreat(text)) {
+    return setRisk({
+      level: "high",
+      type: "legal_threat",
+      shouldHandoff: rules.handoff_on_legal_threat !== false,
+      reason: "legal_threat",
+      event: { type: "legal_threat_detected" }
+    });
+  }
+
+  if (detectBadReviewThreat(text)) {
+    return setRisk({
+      level: "high",
+      type: "bad_review_threat",
+      shouldHandoff: rules.handoff_on_bad_review_threat !== false,
+      reason: "bad_review_threat",
+      event: { type: "bad_review_threat_detected" }
+    });
+  }
+
+  if (detectReputationRisk(text)) {
+    return setRisk({
+      level: "high",
+      type: "reputation_risk",
+      shouldHandoff: rules.handoff_on_reputation_risk !== false,
+      reason: "reputation_risk",
+      event: { type: "reputation_risk_detected" }
+    });
+  }
+
+  if (detectAggressionWithComplaint(text)) {
+    return setRisk({
+      level: "high",
+      type: "aggression",
+      shouldHandoff: rules.handoff_on_aggression !== false,
+      reason: "aggression_with_complaint",
+      event: { type: "aggression_with_complaint_detected" }
+    });
+  }
+
+  if (detectMedicalRisk(text)) {
+    return setRisk({
+      level: "high",
+      type: "medical_risk",
+      shouldHandoff: rules.handoff_on_medical_risk !== false || agentOutput.should_handoff,
+      reason: "medical_risk",
+      event: { type: "medical_risk_detected" }
+    });
+  }
+
+  if (detectDiscountRequest(text)) {
+    return setRisk({
+      level: "medium",
+      type: "discount_request",
+      shouldHandoff: rules.handoff_on_discount_request === true,
+      reason: "discount_request",
+      event: { type: "discount_request_detected" }
+    });
+  }
+
+  if (detectPriceObjection(text)) {
+    const rounds = countRecentPriceObjections(recentMessages) + 1;
+    const threshold = Number(rules.price_objection_rounds_before_handoff || 2);
+    const shouldHandoff = rounds >= threshold;
+    events.push({ type: "price_objection_detected", rounds, threshold });
+    if (shouldHandoff) {
+      events.push({ type: "price_objection_handoff_threshold_reached", rounds, threshold });
+    }
+    return setRisk({
+      level: shouldHandoff ? "medium" : "low",
+      type: "price_objection",
+      shouldHandoff,
+      reason: shouldHandoff ? "price_objection_threshold_reached" : "price_objection"
+    });
+  }
+
+  return result;
+}
+
+function buildRiskGuard(risk = {}) {
+  if (!risk.should_handoff) return null;
+
+  return {
+    intent: "handoff",
+    action: "handoff_to_admin",
+    state: "handoff_required",
+    shouldHandoff: true,
+    angry: ["aggression", "wrong_booking_complaint"].includes(risk.risk_type),
+    reason: risk.reason || risk.risk_type || "high_risk_conversation",
+    risk,
+    events: [
+      ...(risk.events || []),
+      { type: "handoff_created_high_risk", risk_type: risk.risk_type, risk_level: risk.risk_level },
+      { type: "ai_disabled_after_handoff", reason: risk.reason || risk.risk_type }
+    ]
+  };
+}
+
+function detectPriceObjection(text = "") {
+  return /(дорог|дорого|конск.{0,10}цен|почему\s+так\s+дорого|у\s+других\s+дешевле|в\s+другой\s+клинике\s+дешевле|дешевле|за\s*\d{3,6}\s*(?:руб|р|₽)?\s*(?:сделаете|можно|будет)|скиньте\s+цену)/iu.test(text);
+}
+
+function detectDiscountRequest(text = "") {
+  return /(скидк|скиньте|торг|дешевле\s+сдела|можно\s+подешевле|за\s*\d{3,6}\s*(?:руб|р|₽)?\s*(?:сделаете|можно|будет))/iu.test(text);
+}
+
+function detectBadReviewThreat(text = "") {
+  return /(отзыв|отзовик|яндекс|2гис|google|гугл).{0,40}(плох|негатив|напиш|остав|жалоб)|напишу.{0,40}(плох|негатив).{0,40}отзыв/iu.test(text);
+}
+
+function detectReputationRisk(text = "") {
+  return /(всем\s+расскаж|везде\s+напиш|опозор|репутац|разнесу|в\s+соцсет|в\s+инст|в\s+телеграм|в\s+групп)/iu.test(text);
+}
+
+function detectLegalThreat(text = "") {
+  return /(суд|юрист|адвокат|прокуратур|роспотреб|минздрав|иск|заявлени[ея]\s+на\s+вас|буду\s+жаловаться)/iu.test(text);
+}
+
+function detectWrongBookingComplaint(text = "") {
+  return /(зачем\s+вы\s+меня\s+записал|я\s+не\s+просил|я\s+не\s+просила|без\s+моего\s+подтверждения|мы\s+еще\s+ничего\s+не\s+обговорили|мы\s+ещё\s+ничего\s+не\s+обговорили|я\s+не\s+подтверждал|я\s+не\s+подтверждала)/iu.test(text);
+}
+
+function detectAggressionWithComplaint(text = "") {
+  const aggressive = /(ебан|ебл|нах|хуй|пизд|бля|сука|охуел|охуели|урод|долбо|туп)/iu.test(text);
+  const complaint = /(запис|цена|дорог|почему|что\s+за|вы\s+что|вы\s+чо|не\s+просил|не\s+надо|отмен|удалите\s+запись)/iu.test(text);
+  return aggressive && complaint;
+}
+
+function detectMedicalRisk(text = "") {
+  return /(отек|отёк|температур|кровотеч|кровь\s+не\s+останавливается|травм|сильн.{0,20}бол|дышать\s+тяжело|глотать\s+тяжело|гной|инфекц|после\s+операц)/iu.test(text);
+}
+
+function countRecentPriceObjections(messages = []) {
+  return messages.filter((message) => message.direction === "incoming" && detectPriceObjection(message.text || "")).length;
+}
+
 export function detectDentalServiceIntent(text = "") {
   const lower = String(text || "").toLowerCase();
   const wisdom = /(удал(?:ить|ите|ение|ен[а-я]*)|вырвать|вырывать).{0,40}(зуб(?:а|ы)?\s+мудрости|мудрости|восьм[её]рк[ауи]?)|(зуб(?:а|ы)?\s+мудрости|восьм[её]рк[ауи]?).{0,40}(удал(?:ить|ите|ение|ен[а-я]*)|вырвать|вырывать)/iu.test(lower);
@@ -1373,7 +1702,7 @@ function resolveNextConversationState({
   informationQuestion = false,
   agentResult = {}
 } = {}) {
-  if (currentState === "cancellation_requested" || currentState === "handoff_required") return currentState;
+  if (currentState === "cancellation_requested" || currentState === "handoff_required" || currentState === "human_takeover") return currentState;
   if (agentResult.should_handoff) return "handoff_required";
   if (slotConflict) return "collecting_booking_data";
   if (appointmentRequest?.status === "confirmed" || appointmentValidation.allowed) return "appointment_booked";
@@ -1432,6 +1761,22 @@ export function buildSafeScriptedReply({
     return `${prefix}здравствуйте! Подскажите, что хотите уточнить по лечению, стоимости или записи?`;
   }
 
+  if (intent === "handoff") {
+    if (/зачем|не\s+просил|без\s+подтверждения|записал/iu.test(messageText)) {
+      return "Вы правы, без подтверждения запись создавать нельзя. Я остановлю автоматические действия и передам администратору.";
+    }
+
+    if (/отзыв|суд|юрист|прокуратур|роспотреб|минздрав|жалоб|репутац|всем\s+расскаж/iu.test(messageText)) {
+      return "Понимаю, вопрос важный. Я остановлю автоматические ответы и передам администратору, чтобы он разобрался лично.";
+    }
+
+    if (/дорог|дешевле|скидк|подешевле|торг/iu.test(messageText)) {
+      return "Понимаю вопрос по стоимости. Передам администратору, чтобы он проверил возможные варианты и ответил точнее.";
+    }
+
+    return "Понимаю, ситуация требует внимания. Я остановлю автоматические действия и передам администратору, чтобы всё проверили.";
+  }
+
   if (intent === "abuse") {
     if (activeAppointment?.status === "confirmed" || state === "handoff_required") {
       return "Понимаю, ситуация неприятная. Автоматические действия остановлю и передам администратору, чтобы всё проверили.";
@@ -1470,6 +1815,94 @@ function buildDentalServiceInfoReply({ service = "", serviceCategory = "", messa
   return `${service || "Услуга"} зависит от ситуации после осмотра. Могу подсказать по записи или передать вопрос администратору.`;
 }
 
+function buildPriceObjectionReply({ messageText = "", memory = {}, rounds = 1 } = {}) {
+  const service = memory.requested_service || memory.complaint || "";
+
+  if (/за\s*\d{3,6}/iu.test(messageText) || /скидк|подешевле|торг|скиньте/iu.test(messageText)) {
+    return service
+      ? `По ${service} цену лучше не обещать наугад: она зависит от объема и сложности. Могу передать администратору, чтобы он проверил, есть ли подходящие варианты по стоимости.`
+      : "По скидкам и точной стоимости лучше проверит администратор. Могу передать ему вопрос, чтобы он сориентировал по возможным вариантам.";
+  }
+
+  if (rounds > 1) {
+    return "Понимаю, что стоимость важна. Цена зависит от объема лечения и материалов, поэтому точнее сориентирует администратор или врач после уточнения ситуации.";
+  }
+
+  return service
+    ? `По ${service} стоимость зависит от сложности случая и объема лечения. Могу сориентировать по прайсу или передать администратору для точного расчета.`
+    : "Понимаю вопрос по цене. Стоимость зависит от услуги и объема лечения, поэтому могу сориентировать по прайсу или передать администратору для точного ответа.";
+}
+
+function buildOutsideWorkingHoursReply({ validation = {}, memory = {}, messageText = "" } = {}) {
+  const casual = isCasualMessage(messageText);
+  const date = validation.date ? formatBookingDateForReply(validation.date) : null;
+  const time = validation.time || memory.preferred_time || "";
+
+  if (validation.reason === "clinic_closed") {
+    return casual
+      ? `В этот день клиника не работает. Киньте другой день и время, проверю вариант.`
+      : `В выбранный день клиника не работает. Подскажите, пожалуйста, другой день и удобное время.`;
+  }
+
+  const windowText = validation.open && validation.close
+    ? `Рабочее время в этот день: ${validation.open}-${validation.close}.`
+    : "Запись доступна в рабочее время клиники.";
+
+  return casual
+    ? `${time ? `На ${time}` : "На это время"} не получится, это вне рабочего времени. ${windowText} Напишите другое время, проверю.`
+    : `${date && time ? `На ${date} в ${time}` : "На выбранное время"} записать не получится: это вне рабочего времени клиники. ${windowText} Подскажите другое удобное время.`;
+}
+
+export function applyHardSafetyOverrides({ agentResult = {}, guard = {}, appointmentValidation = {} } = {}) {
+  const safeAgentResult = {
+    ...agentResult,
+    memory_update: { ...(agentResult.memory_update || {}) },
+    memory_patch: { ...(agentResult.memory_patch || {}) }
+  };
+  const events = [];
+
+  if (guard.intent === "booking_request" && isUnsafeDentalServiceAction(safeAgentResult)) {
+    const downgradedAction = appointmentValidation.downgraded_action || guard.safe_next_action || "collect_datetime";
+    events.push({
+      type: "unsafe_action_downgraded",
+      from: safeAgentResult.action || safeAgentResult.intent,
+      to: downgradedAction,
+      reason: "dental_service_not_cancel"
+    });
+    events.push({
+      type: "delete_word_disambiguated_as_service",
+      service: guard.service || guard.extracted?.service || null,
+      service_category: guard.service_category || guard.extracted?.service_category || null
+    });
+
+    safeAgentResult.intent = "booking";
+    safeAgentResult.action = downgradedAction;
+    safeAgentResult.safe_next_action = downgradedAction;
+    safeAgentResult.should_handoff = false;
+    safeAgentResult.handoff_reason = null;
+    safeAgentResult.should_create_appointment_request = false;
+    safeAgentResult.memory_update.status = "collecting_booking_data";
+    safeAgentResult.memory_patch.status = "collecting_booking_data";
+  }
+
+  if (guard.intent === "cancel" && safeAgentResult.action === "create_appointment") {
+    const downgradedAction = guard.shouldHandoff ? "handoff_to_admin" : "cancel_appointment";
+    events.push({
+      type: "unsafe_action_downgraded",
+      from: "create_appointment",
+      to: downgradedAction,
+      reason: "cancel_priority"
+    });
+    safeAgentResult.action = downgradedAction;
+    safeAgentResult.safe_next_action = downgradedAction;
+    safeAgentResult.should_create_appointment_request = false;
+    safeAgentResult.memory_update.status = guard.state || "cancellation_requested";
+    safeAgentResult.memory_patch.status = guard.state || "cancellation_requested";
+  }
+
+  return { agentResult: safeAgentResult, events };
+}
+
 function isUnsafeDentalServiceAction(result = {}) {
   return result.intent === "cancel" ||
     result.action === "cancel_appointment" ||
@@ -1506,13 +1939,182 @@ async function hasRecentSentReminder(appointmentRequestId) {
 }
 
 function shouldHumanizeReplySource(replySource = "") {
+  if (!config.humanizerEnabled) return false;
+  if (!config.humanizerOnlyForComplex) {
+    return new Set([
+      "booking_progress",
+      "booking_confirmed",
+      "slot_conflict",
+      "post_booking_social",
+      "dental_service_info",
+      "outside_working_hours",
+      "price_objection",
+      "reply_builder"
+    ]).has(replySource);
+  }
+
   return new Set([
-    "booking_progress",
-    "booking_confirmed",
     "slot_conflict",
-    "post_booking_social",
-    "dental_service_info"
+    "dental_service_info",
+    "outside_working_hours",
+    "price_objection",
+    "reply_builder"
   ]).has(replySource);
+}
+
+function isClassifierBookingSignal(agentResult = {}) {
+  if (agentResult.classifier_intent !== "booking_request" && agentResult.intent !== "booking") return false;
+  if (agentResult.flags?.is_cancel_appointment) return false;
+  if (["cancel_appointment", "handoff_to_admin"].includes(agentResult.action)) return false;
+  return true;
+}
+
+function buildClassifierGuidedReply({
+  agentResult = {},
+  memory = {},
+  payload = {},
+  messageText = "",
+  appointmentValidation = {},
+  bookingIntent = false
+} = {}) {
+  const classifierIntent = agentResult.classifier_intent || agentResult.intent || "unknown";
+  const extracted = agentResult.extracted || {};
+
+  if (agentResult.should_handoff || agentResult.action === "handoff_to_admin") {
+    return buildSafeScriptedReply({
+      intent: "handoff",
+      action: "handoff_to_admin",
+      state: "handoff_required",
+      memory,
+      payload,
+      messageText,
+      shouldHandoff: true
+    });
+  }
+
+  if (classifierIntent === "noise") {
+    return buildSafeScriptedReply({ intent: "noise", memory, payload, messageText });
+  }
+
+  if (classifierIntent === "greeting") {
+    return buildSafeScriptedReply({ intent: "greeting", state: memory.status || "idle", memory, payload, messageText });
+  }
+
+  if (bookingIntent || classifierIntent === "booking_request") {
+    const missingFields = appointmentValidation.missing_fields?.length
+      ? appointmentValidation.missing_fields
+      : getMissingAppointmentFields({ memory, payload });
+    return buildBookingProgressReply({ memory, payload, missingFields, messageText });
+  }
+
+  if (classifierIntent === "pricing_question") {
+    return buildDentalServiceInfoReply({
+      service: extracted.service || memory.requested_service,
+      serviceCategory: extracted.service_category,
+      messageText
+    });
+  }
+
+  if (classifierIntent === "doctor_question") {
+    return "По врачам сориентирую: в клинике принимают стоматологи по разным направлениям. Напишите, какая услуга нужна, и я подскажу, кого лучше уточнить у администратора.";
+  }
+
+  if (classifierIntent === "service_question") {
+    return buildDentalServiceInfoReply({
+      service: extracted.service || memory.requested_service,
+      serviceCategory: extracted.service_category,
+      messageText
+    });
+  }
+
+  if (classifierIntent === "medical_question") {
+    return "По симптомам лучше не ставить диагноз в переписке. Опишите, что беспокоит и как давно, а при сильной боли, отеке, температуре или кровотечении лучше связаться с клиникой как можно быстрее.";
+  }
+
+  return "Напишите, пожалуйста, что хотите уточнить по лечению, стоимости или записи.";
+}
+
+export function validateRequestedTimeAgainstWorkingHours({ date, relative_date, time, clinicConfig = config } = {}) {
+  const preferredDate = normalizeAppointmentDate(date || relative_date);
+  const preferredTime = normalizeAppointmentTime(time);
+
+  if (!preferredDate || !preferredTime) {
+    return {
+      valid: true,
+      applicable: false,
+      reason: "missing_date_or_time",
+      events: []
+    };
+  }
+
+  const workingHours = clinicConfig.workingHours || {};
+  const timezone = workingHours.timezone || clinicConfig.reminderTimezone || "Europe/Moscow";
+  const dayKey = weekdayKey(preferredDate, timezone);
+  const dayConfig = workingHours.days?.[dayKey] ?? null;
+
+  if (!dayConfig || dayConfig.closed === true) {
+    return {
+      valid: false,
+      applicable: true,
+      reason: "clinic_closed",
+      day: dayKey,
+      date: toBookingIsoDate(preferredDate),
+      time: preferredTime,
+      events: [
+        { type: "time_outside_working_hours", reason: "clinic_closed", day: dayKey, date: toBookingIsoDate(preferredDate), time: preferredTime },
+        { type: "action_downgraded_outside_hours", to: "collect_datetime", reason: "clinic_closed" }
+      ]
+    };
+  }
+
+  const requestedMinutes = minutesFromTime(preferredTime);
+  const openMinutes = minutesFromTime(dayConfig.open || "09:00");
+  const closeMinutes = minutesFromTime(dayConfig.close || "20:00");
+  const valid = requestedMinutes >= openMinutes && requestedMinutes < closeMinutes;
+
+  if (!valid) {
+    return {
+      valid: false,
+      applicable: true,
+      reason: "outside_working_hours",
+      day: dayKey,
+      date: toBookingIsoDate(preferredDate),
+      time: preferredTime,
+      open: dayConfig.open,
+      close: dayConfig.close,
+      events: [
+        {
+          type: "time_outside_working_hours",
+          reason: "outside_working_hours",
+          day: dayKey,
+          date: toBookingIsoDate(preferredDate),
+          time: preferredTime,
+          open: dayConfig.open,
+          close: dayConfig.close
+        },
+        { type: "action_downgraded_outside_hours", to: "collect_datetime", reason: "outside_working_hours" }
+      ]
+    };
+  }
+
+  return {
+    valid: true,
+    applicable: true,
+    reason: null,
+    day: dayKey,
+    date: toBookingIsoDate(preferredDate),
+    time: preferredTime,
+    open: dayConfig.open,
+    close: dayConfig.close,
+    events: [
+      {
+        type: "working_hours_validation_passed",
+        day: dayKey,
+        date: toBookingIsoDate(preferredDate),
+        time: preferredTime
+      }
+    ]
+  };
 }
 
 export function validateAppointmentCreation(output = {}, memory = {}, context = {}) {
@@ -1523,12 +2125,21 @@ export function validateAppointmentCreation(output = {}, memory = {}, context = 
     ? missingFields.filter((field) => field !== "consent_to_book")
     : [...new Set([...missingFields, "consent_to_book"])];
 
-  if (context.cancelIntent || memory.status === "cancellation_requested" || memory.status === "handoff_required" || context.conversationState === "cancellation_requested" || context.conversationState === "handoff_required") {
+  if (context.cancelIntent || memory.status === "cancellation_requested" || memory.status === "handoff_required" || memory.status === "human_takeover" || context.conversationState === "cancellation_requested" || context.conversationState === "handoff_required" || context.conversationState === "human_takeover") {
     return {
       allowed: false,
       missing_fields: [],
-      downgraded_action: memory.status === "handoff_required" || context.conversationState === "handoff_required" ? "handoff_to_admin" : "cancel_appointment",
+      downgraded_action: memory.status === "handoff_required" || memory.status === "human_takeover" || context.conversationState === "handoff_required" || context.conversationState === "human_takeover" ? "handoff_to_admin" : "cancel_appointment",
       reason: "cancel_or_handoff_state_blocks_booking"
+    };
+  }
+
+  if (context.workingHoursValidation?.valid === false) {
+    return {
+      allowed: false,
+      missing_fields: effectiveMissing.includes("preferred_time") ? effectiveMissing : [...new Set([...effectiveMissing, "preferred_time"])],
+      downgraded_action: "collect_datetime",
+      reason: context.workingHoursValidation.reason || "time_outside_working_hours"
     };
   }
 
@@ -1583,6 +2194,20 @@ function chooseDowngradedBookingAction(missingFields = []) {
   if (missingFields.includes("reason")) return "collect_more_info";
   if (missingFields.includes("consent_to_book")) return "offer_booking";
   return "collect_more_info";
+}
+
+function weekdayKey(date, timezone = "Europe/Moscow") {
+  const weekday = new Intl.DateTimeFormat("en-US", {
+    weekday: "long",
+    timeZone: timezone
+  }).format(date).toLowerCase();
+  return weekday;
+}
+
+function minutesFromTime(time = "00:00") {
+  const match = String(time || "").match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return 0;
+  return Number(match[1]) * 60 + Number(match[2]);
 }
 
 function hasExplicitBookingRequest(text = "") {

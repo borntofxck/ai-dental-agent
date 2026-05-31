@@ -11,6 +11,7 @@
     "agent:intent-test": "node scripts/agent-intent-eval.js",
     "agent:state-test": "node scripts/agent-state-eval.js",
     "agent:safety-test": "node scripts/agent-safety-eval.js",
+    "agent:token-test": "node scripts/agent-token-eval.js",
     "booking:test": "node scripts/test-booking-parser.js",
     "clinic:seed": "node scripts/seed-clinic-data.js",
     "db:generate": "prisma generate",

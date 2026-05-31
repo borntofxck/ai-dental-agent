@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {
+  applyHardSafetyOverrides,
   buildSafeScriptedReply,
   detectAmbiguousDeleteIntent,
   detectConversationIntent,
@@ -28,9 +29,40 @@ assert.equal(wisdomTomorrow.extracted.relative_date, "tomorrow");
 assert.ok(["collect_time", "check_slot", "collect_datetime"].includes(wisdomTomorrow.safe_next_action));
 assert.notEqual(wisdomTomorrow.state, "cancellation_requested");
 
+const correctedMistakenCancel = applyHardSafetyOverrides({
+  agentResult: {
+    intent: "cancel",
+    action: "cancel_appointment",
+    should_handoff: true,
+    handoff_reason: "model_confused_delete_tooth",
+    memory_update: { status: "cancellation_requested" },
+    memory_patch: { status: "cancellation_requested" }
+  },
+  guard: wisdomTomorrow,
+  appointmentValidation: { downgraded_action: "collect_datetime" }
+});
+assert.equal(correctedMistakenCancel.agentResult.intent, "booking", "code must correct LLM cancel mistake for tooth extraction");
+assert.equal(correctedMistakenCancel.agentResult.action, "collect_datetime");
+assert.equal(correctedMistakenCancel.agentResult.should_handoff, false);
+assert.equal(correctedMistakenCancel.agentResult.memory_update.status, "collecting_booking_data");
+assert.ok(correctedMistakenCancel.events.some((event) => event.reason === "dental_service_not_cancel"));
+
 const deleteAppointment = detectConversationIntent("удалите запись");
 assert.equal(deleteAppointment.intent, "cancel");
 assert.equal(deleteAppointment.action, "cancel_appointment");
+
+const blockedWrongCreate = applyHardSafetyOverrides({
+  agentResult: {
+    intent: "booking",
+    action: "create_appointment",
+    should_create_appointment_request: true,
+    memory_update: { status: "waiting_booking_confirmation" },
+    memory_patch: { status: "waiting_booking_confirmation" }
+  },
+  guard: deleteAppointment
+});
+assert.equal(blockedWrongCreate.agentResult.action, "cancel_appointment", "cancel hard guard must block model create_appointment");
+assert.equal(blockedWrongCreate.agentResult.should_create_appointment_request, false);
 
 const deleteTooth = detectConversationIntent("удалите зуб");
 assert.equal(deleteTooth.intent, "booking_request");

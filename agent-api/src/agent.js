@@ -7,6 +7,7 @@ import { isSuspiciousReply, normalizeStructuredAgentOutput, sanitizeReplyForUser
 
 const promptPath = new URL("../../prompts/dental_admin_system_prompt.md", import.meta.url);
 const knowledgePath = new URL("../../prompts/clinic_knowledge.md", import.meta.url);
+const classifierPromptPath = new URL("../../prompts/intent_classifier_runtime_prompt.md", import.meta.url);
 
 const structuredOutputPrompt = `
 Верни только JSON без markdown.
@@ -100,6 +101,29 @@ const productionOutputPrompt = `
 - Если вопрос медицинский, срочный или рискованный, не ставь диагноз. Предложи связаться с администратором/врачом; при отеке, температуре, травме, кровотечении, сильной боли, проблемах с дыханием или глотанием urgency = "high", should_handoff = true.
 `;
 
+const agentArchitecturePrompt = `
+Architecture rules:
+- You are an AI dialogue module inside the clinic admin system. Internally you only propose AgentOutput; application code validates state/action safety and executes allowed actions.
+- In reply, sound like a human clinic administrator, but never claim that an appointment, cancellation, reminder or handoff was actually executed unless the current context says it is already confirmed.
+- Use the user's language, typos and emotion as semantic context. Do not rely on keywords only.
+- If unsure whether the user asks about a dental service or appointment cancellation, ask one short clarification question instead of choosing a destructive action.
+`;
+
+const riskHandlingPrompt = `
+Risk and handoff rules:
+- If the user argues about price ("дорого", "у других дешевле", "за 8000 сделаете"), do not agree that the clinic is expensive. Explain calmly that cost depends on case complexity and can be clarified by an administrator.
+- If the user threatens a bad review, reputation damage, legal complaint, regulator complaint, or is angry about a wrong booking, set should_handoff=true and action="handoff_to_admin".
+- If the user is aggressive and also complains about booking, price, service, or clinic behavior, set should_handoff=true.
+- Never continue selling or booking after a high-risk complaint. One calm reply, then handoff.
+- You can include an optional risk object in JSON:
+  "risk": {
+    "risk_level": "low|medium|high",
+    "risk_type": "none|price_objection|aggression|bad_review_threat|reputation_risk|discount_request|medical_risk|wrong_booking_complaint|legal_threat",
+    "should_handoff": false,
+    "reason": "internal short reason"
+  }
+`;
+
 function toGroqHistory(messages) {
   return messages.map((message) => ({
     role: message.role === "assistant" ? "assistant" : "user",
@@ -147,6 +171,366 @@ async function readTextFile(fileUrl) {
     console.warn(`Optional prompt file was not loaded: ${fileUrl.pathname}`, error.message);
     return "";
   }
+}
+
+function estimateTokens(value = "") {
+  return Math.ceil(String(value || "").length / 3.7);
+}
+
+function truncateText(value = "", maxChars = 500) {
+  const text = String(value || "").replace(/\s+/gu, " ").trim();
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, Math.max(0, maxChars - 1)).trim()}…`;
+}
+
+function compactObject(value) {
+  if (Array.isArray(value)) {
+    return value.map(compactObject).filter((item) => item !== undefined && item !== null && item !== "");
+  }
+
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+
+  return Object.fromEntries(
+    Object.entries(value)
+      .map(([key, item]) => [key, compactObject(item)])
+      .filter(([, item]) => item !== undefined && item !== null && item !== "" && !(Array.isArray(item) && item.length === 0))
+  );
+}
+
+function limitObjectChars(value, maxChars = 1000) {
+  const json = JSON.stringify(compactObject(value || {}));
+  if (json.length <= maxChars) return compactObject(value || {});
+
+  const result = {};
+  for (const [key, item] of Object.entries(value || {})) {
+    if (item === null || item === undefined || item === "") continue;
+    result[key] = typeof item === "string" ? truncateText(item, 180) : item;
+  }
+
+  const reducedJson = JSON.stringify(compactObject(result));
+  if (reducedJson.length <= maxChars) return compactObject(result);
+  return parseJsonObject(reducedJson.slice(0, maxChars)) || compactObject(result);
+}
+
+function toDateString(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value).slice(0, 10);
+  return date.toISOString().slice(0, 10);
+}
+
+function summarizeWorkingHours(workingHours = {}) {
+  const days = workingHours.days || {};
+  const opened = Object.entries(days)
+    .filter(([, value]) => value && value.open && value.close && value.closed !== true)
+    .map(([day, value]) => `${day}:${value.open}-${value.close}`);
+  return opened.length ? opened.join(", ") : "09:00-20:00";
+}
+
+function buildUsageEvent({ purpose, model, response }) {
+  const usage = response?.usage || {};
+  return {
+    type: "llm_usage",
+    purpose,
+    provider: "groq",
+    model,
+    prompt_tokens: usage.prompt_tokens ?? null,
+    completion_tokens: usage.completion_tokens ?? null,
+    total_tokens: usage.total_tokens ?? null
+  };
+}
+
+function isRateLimitError(error) {
+  const text = [
+    error?.message,
+    error?.code,
+    error?.status,
+    error?.response?.status,
+    JSON.stringify(error?.response?.data || {})
+  ].filter(Boolean).join(" ").toLowerCase();
+  return /rate_limit|rate limit|429|tpd|tpm|too many requests/u.test(text);
+}
+
+function rateLimitHandoffResponse(error, { purpose = "classifier", model = "", events = [] } = {}) {
+  return {
+    reply: "Сейчас не могу быстро обработать сообщение автоматически. Передам администратору, он ответит в ближайшее время.",
+    intent: "handoff",
+    classifier_intent: "unknown",
+    action: "handoff_to_admin",
+    safe_next_action: "handoff_to_admin",
+    urgency: "medium",
+    should_create_appointment_request: false,
+    should_handoff: true,
+    handoff_reason: "llm_rate_limited",
+    memory_patch: { status: "handoff_required" },
+    memory_update: { status: "handoff_required" },
+    risk: {
+      risk_level: "medium",
+      risk_type: "reputation_risk",
+      should_handoff: true
+    },
+    pipeline_events: [
+      ...events,
+      { type: "llm_rate_limited", purpose, provider: "groq", model, error: error?.message || String(error || "") },
+      { type: "fallback_to_admin_due_to_rate_limit", purpose },
+      { type: "rate_limit_fallback_used", purpose }
+    ]
+  };
+}
+
+function handleTrivialMessageLocally({ userMessage = "", memory = {}, activeAppointment = null } = {}) {
+  const text = String(userMessage || "").trim().toLowerCase();
+  if (!text) return null;
+
+  if (/^(спасибо|спс|благодарю|пасиб|ок|окей|понял|поняла|хорошо|ладно|ага|угу)[.!?\s]*$/iu.test(text)) {
+    const booked = activeAppointment?.status === "confirmed" || memory.status === "appointment_booked";
+    return {
+      reply: booked ? "Пожалуйста. Если что-то изменится, просто напишите сюда." : "Пожалуйста.",
+      intent: "unknown",
+      classifier_intent: "acknowledgement",
+      action: "none",
+      safe_next_action: "ignore",
+      urgency: "low",
+      should_create_appointment_request: false,
+      should_handoff: false,
+      handoff_reason: null,
+      memory_patch: {},
+      memory_update: {},
+      pipeline_events: [
+        { type: "trivial_message_local", reason: "acknowledgement_no_llm" }
+      ]
+    };
+  }
+
+  if (/^(да|нет|\+|-)[.!?\s]*$/iu.test(text)) {
+    return null;
+  }
+
+  return null;
+}
+
+function normalizeClassifierOutput(parsed = {}, userMessage = "", events = []) {
+  const entities = normalizeEntities(parsed.entities || parsed.extracted || {});
+  const flags = parsed.flags && typeof parsed.flags === "object" ? parsed.flags : {};
+  const risk = normalizeClassifierRisk(parsed.risk || {});
+  const rawIntent = String(parsed.intent || "unknown").trim();
+  const safeNextAction = normalizeSafeNextAction(parsed.safe_next_action, rawIntent);
+  const action = mapClassifierAction(safeNextAction, rawIntent);
+  const facts = extractFactsFromMessage(userMessage);
+  const normalizedDate = normalizeClassifierDate(entities.date || entities.relative_date);
+  const memoryPatch = compactObject({
+    name: entities.name,
+    phone: entities.phone,
+    service: entities.service,
+    complaint: entities.complaint || (isBookingLikeIntent(rawIntent) ? entities.service : null),
+    preferred_date: normalizedDate,
+    preferred_time: entities.time,
+    status: stateFromClassifier(rawIntent, safeNextAction)
+  });
+  const memoryUpdate = compactObject({
+    ...facts,
+    patient_name: entities.name || facts.patient_name,
+    phone: entities.phone || facts.phone,
+    requested_service: entities.service || facts.requested_service,
+    complaint: entities.complaint || facts.complaint || (isBookingLikeIntent(rawIntent) ? entities.service : null),
+    preferred_date: normalizedDate || facts.preferred_date,
+    preferred_time: entities.time || facts.preferred_time,
+    intent: isBookingLikeIntent(rawIntent) ? "book_appointment" : facts.intent,
+    consent_to_book: flags.explicit_booking_confirmation === true ? true : facts.consent_to_book,
+    status: memoryPatch.status
+  });
+  const shouldHandoff = Boolean(
+    flags.needs_admin ||
+    flags.is_medical_risk ||
+    risk.should_handoff ||
+    safeNextAction === "handoff_to_admin" ||
+    ["complaint", "abuse"].includes(rawIntent)
+  );
+
+  return {
+    reply: "",
+    intent: mapClassifierIntent(rawIntent),
+    classifier_intent: rawIntent,
+    sub_intent: cleanText(parsed.sub_intent),
+    confidence: normalizeConfidence(parsed.confidence),
+    extracted: entities,
+    flags: {
+      explicit_booking_confirmation: Boolean(flags.explicit_booking_confirmation),
+      is_dental_service: Boolean(flags.is_dental_service),
+      is_cancel_appointment: Boolean(flags.is_cancel_appointment),
+      needs_admin: Boolean(flags.needs_admin),
+      is_medical_risk: Boolean(flags.is_medical_risk)
+    },
+    action,
+    safe_next_action: safeNextAction,
+    requires_clarification: Boolean(parsed.requires_clarification),
+    clarification_question: cleanText(parsed.clarification_question),
+    classifier_reason: cleanText(parsed.reason),
+    should_create_appointment_request: action === "create_appointment",
+    should_handoff: shouldHandoff,
+    handoff_reason: shouldHandoff ? (risk.risk_type !== "none" ? risk.risk_type : cleanText(parsed.reason) || "classifier_requested_handoff") : null,
+    urgency: risk.risk_level === "high" ? "high" : (risk.risk_level === "medium" ? "medium" : "low"),
+    risk,
+    memory_patch: memoryPatch,
+    memory_update: memoryUpdate,
+    pipeline_events: events
+  };
+}
+
+function normalizeClassifierDate(value) {
+  const text = String(value || "").trim().toLowerCase();
+  if (!text) return null;
+  if (/\b\d{4}-\d{2}-\d{2}\b/u.test(text)) return text.match(/\b\d{4}-\d{2}-\d{2}\b/u)[0];
+  if (/(day_after_tomorrow|after tomorrow|послезавтра)/iu.test(text)) return addDaysIso(2);
+  if (/(tomorrow|завтра)/iu.test(text)) return addDaysIso(1);
+  if (/(today|сегодня)/iu.test(text)) return addDaysIso(0);
+  return value;
+}
+
+function localClassifierFallback(userMessage = "", { events = [] } = {}) {
+  const inferred = inferFromMessage(userMessage);
+  const intent = inferred.intent === "book_appointment"
+    ? "booking_request"
+    : (inferred.intent === "price_question" ? "pricing_question" : "unknown");
+  return normalizeClassifierOutput({
+    intent,
+    confidence: 0.35,
+    entities: {},
+    flags: {},
+    safe_next_action: intent === "booking_request" ? "collect_booking_data" : "answer_question",
+    risk: { risk_level: "low", risk_type: "none", should_handoff: false },
+    reason: "local_classifier_fallback"
+  }, userMessage, events);
+}
+
+function normalizeEntities(value = {}) {
+  const entities = value && typeof value === "object" ? value : {};
+  return compactObject({
+    name: cleanText(entities.name),
+    phone: cleanText(entities.phone),
+    service: cleanText(entities.service),
+    service_category: cleanText(entities.service_category),
+    complaint: cleanText(entities.complaint),
+    date: cleanText(entities.date),
+    relative_date: cleanText(entities.relative_date),
+    time: cleanText(entities.time),
+    doctor: cleanText(entities.doctor),
+    appointment_reference: cleanText(entities.appointment_reference)
+  });
+}
+
+function normalizeClassifierRisk(value = {}) {
+  const risk = value && typeof value === "object" ? value : {};
+  const level = ["low", "medium", "high"].includes(risk.risk_level) ? risk.risk_level : "low";
+  const type = [
+    "none",
+    "price_objection",
+    "aggression",
+    "bad_review_threat",
+    "reputation_risk",
+    "discount_request",
+    "medical_risk",
+    "wrong_booking_complaint",
+    "legal_threat"
+  ].includes(risk.risk_type) ? risk.risk_type : "none";
+  return {
+    risk_level: level,
+    risk_type: type,
+    should_handoff: Boolean(risk.should_handoff)
+  };
+}
+
+function normalizeSafeNextAction(value, intent = "unknown") {
+  const action = String(value || "").trim();
+  const allowed = new Set([
+    "answer_question",
+    "ask_clarification",
+    "collect_booking_data",
+    "collect_name",
+    "collect_phone",
+    "collect_date",
+    "collect_time",
+    "check_slot",
+    "create_appointment_candidate",
+    "cancel_appointment_candidate",
+    "reschedule_appointment_candidate",
+    "handoff_to_admin",
+    "ignore"
+  ]);
+  if (allowed.has(action)) return action;
+  if (intent === "cancel") return "cancel_appointment_candidate";
+  if (intent === "reschedule" || intent === "appointment_change") return "reschedule_appointment_candidate";
+  if (isBookingLikeIntent(intent)) return "collect_booking_data";
+  if (["pricing_question", "service_question", "doctor_question", "medical_question"].includes(intent)) return "answer_question";
+  return "answer_question";
+}
+
+function mapClassifierAction(safeNextAction, intent = "unknown") {
+  const map = {
+    answer_question: "answer_question",
+    ask_clarification: "collect_more_info",
+    collect_booking_data: "collect_more_info",
+    collect_name: "collect_name",
+    collect_phone: "collect_phone",
+    collect_date: "collect_datetime",
+    collect_time: "collect_datetime",
+    check_slot: "collect_datetime",
+    create_appointment_candidate: "create_appointment",
+    cancel_appointment_candidate: "cancel_appointment",
+    reschedule_appointment_candidate: "reschedule_appointment",
+    handoff_to_admin: "handoff_to_admin",
+    ignore: "none"
+  };
+  if (map[safeNextAction]) return map[safeNextAction];
+  if (intent === "cancel") return "cancel_appointment";
+  if (intent === "reschedule") return "reschedule_appointment";
+  return "none";
+}
+
+function mapClassifierIntent(intent) {
+  const map = {
+    booking_request: "booking",
+    pricing_question: "pricing",
+    service_question: "service_question",
+    doctor_question: "service_question",
+    medical_question: "service_question",
+    appointment_change: "reschedule",
+    reschedule: "reschedule",
+    cancel: "cancel",
+    complaint: "complaint",
+    abuse: "abuse",
+    noise: "unknown",
+    greeting: "unknown",
+    unknown: "unknown"
+  };
+  return map[intent] || "unknown";
+}
+
+function stateFromClassifier(intent, safeNextAction) {
+  if (safeNextAction === "handoff_to_admin" || ["complaint", "abuse"].includes(intent)) return "handoff_required";
+  if (intent === "cancel") return "cancellation_requested";
+  if (intent === "reschedule" || intent === "appointment_change") return "reschedule_requested";
+  if (isBookingLikeIntent(intent)) return "collecting_booking_data";
+  if (["pricing_question", "service_question", "doctor_question", "medical_question"].includes(intent)) return "answering_question";
+  return null;
+}
+
+function isBookingLikeIntent(intent = "") {
+  return intent === "booking_request";
+}
+
+function normalizeConfidence(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return null;
+  return Math.max(0, Math.min(1, number));
+}
+
+function cleanText(value) {
+  const text = String(value ?? "").trim();
+  if (!text || /^(null|undefined)$/iu.test(text)) return null;
+  return truncateText(text, 500);
 }
 
 function inferFromMessage(userMessage) {
@@ -236,31 +620,22 @@ function inferFromMessage(userMessage) {
 }
 
 function improveAgentResult(result, userMessage) {
-  const inferred = inferFromMessage(userMessage);
   const extracted = extractFactsFromMessage(userMessage);
   const memoryUpdate = {
     ...(result.memory_update || {}),
-    ...(inferred.memory_update || {}),
     ...extracted
   };
 
   return {
     ...result,
     reply: sanitizeReplyForUser(
-      sanitizeReply(
-        makeReplyContextual({
-          reply: inferred.reply || result.reply,
-          extracted,
-          memoryUpdate,
-          userMessage
-        })
-      ),
+      sanitizeReply(result.reply),
       { userMessage }
     ),
-    intent: inferred.intent || result.intent,
+    intent: result.intent || "unknown",
     action: result.action || "none",
-    urgency: inferred.urgency || result.urgency,
-    should_create_appointment_request: Boolean(result.should_create_appointment_request),
+    urgency: result.urgency || "low",
+    should_create_appointment_request: result.action === "create_appointment" || Boolean(result.should_create_appointment_request),
     should_handoff: Boolean(result.should_handoff),
     handoff_reason: result.handoff_reason || null,
     memory_patch: result.memory_patch || {},
@@ -412,6 +787,7 @@ export async function generateAgentResponse({ userMessage, history, memory }) {
   }
 
   const groq = new Groq({ apiKey: config.groqApiKey });
+  const model = config.complexModelEnabled ? (config.complexModel || config.groqModel) : config.groqModel;
   const systemPrompt = await readTextFile(promptPath);
   const clinicKnowledge = await readTextFile(knowledgePath);
   const dbClinicKnowledge = await getClinicKnowledgeContext();
@@ -420,7 +796,7 @@ export async function generateAgentResponse({ userMessage, history, memory }) {
   let response;
   try {
     response = await groq.chat.completions.create({
-      model: config.groqModel,
+      model,
       temperature: 0.78,
       max_tokens: config.groqMaxTokens,
       response_format: { type: "json_object" },
@@ -432,6 +808,8 @@ export async function generateAgentResponse({ userMessage, history, memory }) {
             clinicKnowledge ? `База знаний клиники:\n${clinicKnowledge}` : "",
             dbClinicKnowledge ? `Актуальные справочники клиники из PostgreSQL:\n${dbClinicKnowledge}` : "",
             productionOutputPrompt,
+            agentArchitecturePrompt,
+            riskHandlingPrompt,
             `Клиника: ${config.clinicName}`,
             config.clinicPhone ? `Телефон клиники: ${config.clinicPhone}` : "",
             config.clinicAddress ? `Адрес клиники: ${config.clinicAddress}` : "",
@@ -444,6 +822,14 @@ export async function generateAgentResponse({ userMessage, history, memory }) {
       ]
     });
   } catch (error) {
+    if (isRateLimitError(error)) {
+      return rateLimitHandoffResponse(error, {
+        purpose: "complex",
+        model,
+        events: [{ type: "complex_model_used", model }]
+      });
+    }
+
     console.warn("Groq request failed, using local fallback:", error.message);
     return improveAgentResult(normalizeStructuredAgentOutput({
       ...fallbackResponse(userMessage, memory),
@@ -462,13 +848,218 @@ export async function generateAgentResponse({ userMessage, history, memory }) {
       ...fallbackResponse(userMessage, memory),
       raw_model_response: text,
       pipeline_events: [
+        buildUsageEvent({ purpose: "complex", model, response }),
         { type: "llm_parse_failed", reason: "missing_reply_or_invalid_json" },
         { type: "fallback_used", reason: "llm_parse_failed" }
       ]
     }, userMessage), userMessage);
   }
 
-  return improveAgentResult(normalizeStructuredAgentOutput(parsed, userMessage), userMessage);
+  return improveAgentResult(normalizeStructuredAgentOutput({
+    ...parsed,
+    pipeline_events: [
+      ...(Array.isArray(parsed.pipeline_events) ? parsed.pipeline_events : []),
+      { type: "complex_model_used", model },
+      buildUsageEvent({ purpose: "complex", model, response })
+    ]
+  }, userMessage), userMessage);
+}
+
+export function buildCompactLLMContext({
+  userMessage = "",
+  memory = {},
+  history = [],
+  conversationState = "",
+  activeAppointment = null,
+  bookingDraft = null,
+  lastOutboundContext = null,
+  clinicConfig = config
+} = {}) {
+  const maxMessages = Math.max(1, Number(clinicConfig.maxLastMessages || 6));
+  const compactMemory = compactObject({
+    name: memory.patient_name || memory.name,
+    phone: memory.phone,
+    service: memory.requested_service || memory.service,
+    complaint: memory.complaint,
+    preferred_date: memory.preferred_date,
+    preferred_time: memory.preferred_time,
+    status: memory.status
+  });
+  const active = activeAppointment ? compactObject({
+    date: toDateString(activeAppointment.preferredDate),
+    time: activeAppointment.preferredTime,
+    service: activeAppointment.requestedService,
+    complaint: activeAppointment.complaint,
+    status: activeAppointment.status
+  }) : null;
+  const draft = bookingDraft ? compactObject(bookingDraft) : compactObject({
+    service: memory.requested_service,
+    date: memory.preferred_date,
+    time: memory.preferred_time,
+    status: memory.status
+  });
+  const lastMessages = history
+    .slice(-maxMessages)
+    .map((message) => ({
+      role: message.role === "assistant" ? "assistant" : "user",
+      text: truncateText(message.text, 350)
+    }))
+    .filter((message) => message.text);
+
+  const context = {
+    conversation_state: conversationState || memory.status || "unknown",
+    memory: limitObjectChars(compactMemory, clinicConfig.maxMemoryChars || 1000),
+    active_appointment: active,
+    booking_draft: draft,
+    last_outbound_context: lastOutboundContext ? compactObject(lastOutboundContext) : null,
+    clinic: {
+      name: clinicConfig.clinicName || "DentalCare",
+      working_hours_summary: summarizeWorkingHours(clinicConfig.workingHours),
+      known_service_categories: [
+        "hygiene",
+        "caries_treatment",
+        "tooth_extraction",
+        "wisdom_tooth_extraction",
+        "consultation",
+        "implant",
+        "orthodontics"
+      ],
+      has_prices: true,
+      timezone: clinicConfig.workingHours?.timezone || clinicConfig.reminderTimezone || "Europe/Moscow"
+    },
+    last_messages: lastMessages,
+    user_message: truncateText(userMessage, 1000)
+  };
+
+  const json = JSON.stringify(compactObject(context));
+  const maxChars = Math.max(1000, Number(clinicConfig.maxContextChars || 4000));
+  if (json.length <= maxChars) {
+    return {
+      context: compactObject(context),
+      events: []
+    };
+  }
+
+  const reduced = {
+    ...context,
+    last_messages: lastMessages.slice(-2),
+    memory: limitObjectChars(compactMemory, Math.min(600, Number(clinicConfig.maxMemoryChars || 1000))),
+    user_message: truncateText(userMessage, 700)
+  };
+
+  return {
+    context: compactObject(reduced),
+    events: [
+      {
+        type: "context_truncated",
+        original_chars: json.length,
+        max_chars: maxChars
+      }
+    ]
+  };
+}
+
+export async function classifyUserIntentWithLLM({
+  userMessage,
+  history = [],
+  memory = {},
+  conversationState = "",
+  activeAppointment = null,
+  bookingDraft = null,
+  lastOutboundContext = null
+} = {}) {
+  const local = handleTrivialMessageLocally({ userMessage, memory, conversationState, activeAppointment });
+  if (local) return local;
+
+  const compact = buildCompactLLMContext({
+    userMessage,
+    history,
+    memory,
+    conversationState,
+    activeAppointment,
+    bookingDraft,
+    lastOutboundContext,
+    clinicConfig: config
+  });
+  const runtimePrompt = await readTextFile(classifierPromptPath);
+  const promptText = [
+    runtimePrompt,
+    "Return JSON only. No reply text for the patient."
+  ].filter(Boolean).join("\n\n");
+  const inputText = JSON.stringify(compact.context);
+  const inputTokenEstimate = estimateTokens(`${promptText}\n${inputText}`);
+  const events = [
+    ...compact.events,
+    {
+      type: "classifier_model_used",
+      model: config.classifierModel || config.groqModel,
+      input_token_estimate: inputTokenEstimate
+    }
+  ];
+
+  if (inputTokenEstimate > Number(config.maxClassifierInputTokens || 2000)) {
+    events.push({
+      type: "llm_prompt_too_large",
+      purpose: "classifier",
+      input_token_estimate: inputTokenEstimate,
+      max_tokens: config.maxClassifierInputTokens
+    });
+  }
+
+  if (!config.groqApiKey || config.groqApiKey === "your_groq_api_key_here") {
+    return localClassifierFallback(userMessage, {
+      events: [
+        ...events,
+        { type: "fallback_used", reason: "missing_groq_api_key", purpose: "classifier" }
+      ]
+    });
+  }
+
+  const groq = new Groq({ apiKey: config.groqApiKey });
+  const model = config.classifierModel || config.groqModel;
+
+  try {
+    const response = await groq.chat.completions.create({
+      model,
+      temperature: 0.12,
+      max_tokens: config.classifierMaxTokens || 450,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: promptText },
+        { role: "user", content: inputText }
+      ]
+    });
+    events.push(buildUsageEvent({ purpose: "classifier", model, response }));
+    const raw = response.choices?.[0]?.message?.content || "";
+    const parsed = parseJsonObject(raw);
+
+    if (!parsed || typeof parsed !== "object") {
+      return localClassifierFallback(userMessage, {
+        events: [
+          ...events,
+          { type: "llm_parse_failed", reason: "classifier_invalid_json" },
+          { type: "fallback_used", reason: "classifier_parse_failed" }
+        ]
+      });
+    }
+
+    return normalizeClassifierOutput(parsed, userMessage, events);
+  } catch (error) {
+    if (isRateLimitError(error)) {
+      return rateLimitHandoffResponse(error, {
+        purpose: "classifier",
+        model,
+        events
+      });
+    }
+
+    return localClassifierFallback(userMessage, {
+      events: [
+        ...events,
+        { type: "fallback_used", reason: "classifier_llm_failed", error: error.message }
+      ]
+    });
+  }
 }
 
 export async function humanizeReplyWithAI({ safeReply, userMessage = "", action = "none", state = "idle" } = {}) {
@@ -481,17 +1072,51 @@ export async function humanizeReplyWithAI({ safeReply, userMessage = "", action 
     };
   }
 
+  if (!config.humanizerEnabled) {
+    return {
+      reply: originalReply,
+      used: false,
+      events: [{ type: "humanizer_skipped_disabled" }]
+    };
+  }
+
+  if (config.humanizerSkipSimple && shouldSkipHumanizer({ safeReply: originalReply, userMessage, action, state })) {
+    return {
+      reply: originalReply,
+      used: false,
+      events: [{ type: "humanizer_skipped_simple", action, state }]
+    };
+  }
+
+  const inputTokenEstimate = estimateTokens(JSON.stringify({ safeReply: originalReply, userMessage, action, state }));
+  if (inputTokenEstimate > Number(config.maxHumanizerInputTokens || 800)) {
+    return {
+      reply: originalReply,
+      used: false,
+      events: [
+        {
+          type: "llm_prompt_too_large",
+          purpose: "humanizer",
+          input_token_estimate: inputTokenEstimate,
+          max_tokens: config.maxHumanizerInputTokens
+        },
+        { type: "humanizer_skipped_too_large" }
+      ]
+    };
+  }
+
   if (!config.groqApiKey || config.groqApiKey === "your_groq_api_key_here") {
     return { reply: originalReply, used: false, events: [] };
   }
 
   const groq = new Groq({ apiKey: config.groqApiKey });
+  const model = config.humanizerModel || config.groqModel;
 
   try {
     const response = await groq.chat.completions.create({
-      model: config.groqModel,
+      model,
       temperature: 0.35,
-      max_tokens: 160,
+      max_tokens: config.humanizerMaxTokens || 140,
       response_format: { type: "json_object" },
       messages: [
         {
@@ -502,6 +1127,7 @@ export async function humanizeReplyWithAI({ safeReply, userMessage = "", action 
             "Нельзя менять смысл, action, состояние, дату, время, цену, врача, факт записи или отмены.",
             "Нельзя добавлять обещания, которых нет в исходном safeReply.",
             "Если safeReply говорит, что запись не создается, нельзя писать, что запись создана или что пациента ждут.",
+            "Если safeReply передает конфликт, цену, жалобу или угрозу администратору, сохрани этот смысл и не спорь с клиентом.",
             "Итог: 1-3 коротких предложения, без JSON/intent/action/memory/tool/system/reasoning в reply."
           ].join("\n")
         },
@@ -540,15 +1166,53 @@ export async function humanizeReplyWithAI({ safeReply, userMessage = "", action 
     return {
       reply: sanitizeReplyForUser(candidate, { userMessage }),
       used: true,
-      events: [{ type: "humanizer_used", action, state }]
+      events: [
+        { type: "humanizer_model_used", model, input_token_estimate: inputTokenEstimate },
+        buildUsageEvent({ purpose: "humanizer", model, response }),
+        { type: "humanizer_used", action, state }
+      ]
     };
   } catch (error) {
+    if (isRateLimitError(error)) {
+      return {
+        reply: originalReply,
+        used: false,
+        events: [
+          { type: "llm_rate_limited", purpose: "humanizer", provider: "groq", model, error: error.message },
+          { type: "rate_limit_fallback_used", purpose: "humanizer" },
+          { type: "humanizer_failed", reason: "rate_limited" }
+        ]
+      };
+    }
+
     return {
       reply: originalReply,
       used: false,
       events: [{ type: "humanizer_failed", reason: error.message }]
     };
   }
+}
+
+function shouldSkipHumanizer({ safeReply = "", action = "none", state = "idle" } = {}) {
+  const text = String(safeReply || "").toLowerCase();
+  const simpleActions = new Set([
+    "none",
+    "answer_question",
+    "collect_name",
+    "collect_phone",
+    "collect_datetime",
+    "send_reminder"
+  ]);
+
+  if (!config.humanizerOnlyForComplex) return false;
+  if (simpleActions.has(action) && !/жалоб|администратор|передам|дорог|скидк|угроз|отзыв|суд|репутац|неприятн/iu.test(text)) {
+    return true;
+  }
+
+  if (state === "idle" && text.length < 180) return true;
+  if (/^(здравствуйте|добрый день|пожалуйста|хорошо|поняла|понял)[!.?\s]*$/iu.test(text)) return true;
+
+  return false;
 }
 
 export function isHumanizedReplyAllowed({ safeReply = "", candidate = "", action = "none", state = "idle" } = {}) {
