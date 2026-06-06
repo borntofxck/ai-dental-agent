@@ -14,6 +14,8 @@ import {
   isBookingIntent,
   normalizeBookingMemory
 } from "../agent-api/src/bookingParser.js";
+import { classifyUserIntentWithLLM } from "../agent-api/src/agent.js";
+import { config } from "../agent-api/src/config.js";
 
 const baseDate = new Date("2026-05-27T10:00:00+05:00");
 const payload = { max_user_id: "max_test", display_name: "Ярослав" };
@@ -75,6 +77,49 @@ assert.equal(priceWisdom.service_category, "wisdom_tooth_extraction");
 assert.notEqual(priceWisdom.action, "create_appointment");
 assert.notEqual(priceWisdom.action, "cancel_appointment");
 
+const wisdomTeethPriceSlang = detectConversationIntent("у меня чот зубы мудрости режутся чо делать и как по бабкам у вас это выйдет");
+assert.equal(wisdomTeethPriceSlang.intent, "pricing_question", "wisdom_teeth_price_slang");
+assert.equal(wisdomTeethPriceSlang.sub_intent, "medical_context_price");
+assert.equal(wisdomTeethPriceSlang.service_category, "wisdom_tooth_extraction");
+assert.equal(wisdomTeethPriceSlang.complaint, "режутся зубы мудрости");
+assert.deepEqual(wisdomTeethPriceSlang.secondary_intents, ["medical_question", "service_question"]);
+assert.equal(wisdomTeethPriceSlang.shouldHandoff, false);
+assert.notEqual(wisdomTeethPriceSlang.intent, "cancel");
+
+const wisdomTeethSkok = detectConversationIntent("скок выйдет если восьмёрка лезет");
+assert.equal(wisdomTeethSkok.intent, "pricing_question", "wisdom_teeth_skok");
+assert.equal(wisdomTeethSkok.service_category, "wisdom_tooth_extraction");
+assert.equal(wisdomTeethSkok.complaint, "режутся зубы мудрости");
+
+const wisdomTeethWhatToDo = detectConversationIntent("зубы мудрости режутся чо делать");
+assert.equal(wisdomTeethWhatToDo.intent, "service_question", "wisdom_teeth_what_to_do");
+assert.equal(wisdomTeethWhatToDo.service_category, "wisdom_tooth_extraction");
+assert.deepEqual(wisdomTeethWhatToDo.secondary_intents, ["medical_question"]);
+assert.equal(wisdomTeethWhatToDo.shouldHandoff, false);
+
+const understoodEntityReply = buildSafeScriptedReply({
+  intent: "unknown",
+  messageText: "зубы мудрости режутся чо делать"
+});
+assert.doesNotMatch(understoodEntityReply, /что хотите уточнить по (лечению|услугам),? стоимости или записи/iu, "understood_entity_prevents_generic_fallback");
+assert.match(understoodEntityReply, /зубы мудрости|осмотр|стоматолог/iu);
+
+const oldGroqApiKey = config.groqApiKey;
+config.groqApiKey = "";
+try {
+  const localPriceSlang = await classifyUserIntentWithLLM({
+    userMessage: "как по бабкам у вас зубы мудрости",
+    history: [],
+    memory: {}
+  });
+  assert.equal(localPriceSlang.classifier_intent, "pricing_question", "price_slang_babki");
+  assert.equal(localPriceSlang.extracted.service_category, "wisdom_tooth_extraction");
+  assert.equal(localPriceSlang.flags.is_dental_service, true);
+  assert.notEqual(localPriceSlang.classifier_intent, "unknown");
+} finally {
+  config.groqApiKey = oldGroqApiKey;
+}
+
 const ambiguous = detectConversationIntent("удалите зуб мудрости запись не нужна");
 assert.equal(ambiguous.reason, "ambiguous_delete_intent");
 assert.equal(ambiguous.shouldHandoff, true);
@@ -95,7 +140,7 @@ const recovery = buildValidation("нужно удалить зуб мудрос�
 assert.equal(recovery.bookingIntent, true, "normal message after noise must recover as booking request");
 assert.equal(recovery.validation.allowed, false, "no appointment without explicit confirmation");
 assert.ok(recovery.validation.missing_fields.includes("preferred_time"), "missing time must be collected");
-assert.ok(recovery.validation.missing_fields.includes("consent_to_book"), "confirmation still required");
+assert.ok(!recovery.validation.missing_fields.includes("consent_to_book"), "confirmation must wait until concrete slot is selected");
 assert.notEqual(recovery.validation.downgraded_action, "cancel_appointment");
 
 const serviceAndDate = buildValidation("нужно удалить зуб мудрости и завтра думаю удобно бы");

@@ -273,7 +273,10 @@ async function loadConversation(id) {
           <div class="fw-semibold">${escapeHtml(contact.displayName || contact.maxUserId || `Контакт ${conversation.contactId}`)}</div>
           <div class="small-muted">${escapeHtml(contact.maxUserId || "-")} · ${escapeHtml(conversation.channel || "-")}</div>
         </div>
-        <div>${badge(conversation.status)}</div>
+        <div class="d-flex align-items-start gap-2">
+          <button class="btn btn-sm btn-outline-danger" data-reset-conversation-context="${conversation.id}">Сбросить контекст</button>
+          ${badge(conversation.status)}
+        </div>
       </div>
     </div>
     <div class="messages">
@@ -701,6 +704,16 @@ function bindEvents() {
   });
 
   $("#conversationDetail").addEventListener("click", async (event) => {
+    const resetButton = event.target.closest("[data-reset-conversation-context]");
+    if (resetButton) {
+      const ok = window.confirm("Сбросить память диалога, закрыть handoff и начать новый контекст для этого контакта?");
+      if (!ok) return;
+      await api(`/conversations/${resetButton.dataset.resetConversationContext}/reset-context`, { method: "POST" });
+      toast("Контекст сброшен");
+      await loadConversation(resetButton.dataset.resetConversationContext);
+      return;
+    }
+
     const button = event.target.closest("[data-resolve-handoff]");
     if (!button) return;
     await api(`/handoffs/${button.dataset.resolveHandoff}/resolve`, { method: "PATCH" });

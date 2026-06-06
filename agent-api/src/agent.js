@@ -4,6 +4,7 @@ import { config } from "./config.js";
 import { getClinicKnowledgeContext } from "./clinicDataService.js";
 import { parseJsonObject } from "./json.js";
 import { isSuspiciousReply, normalizeStructuredAgentOutput, sanitizeReplyForUser } from "./replySanitizer.js";
+import { extractPreferredDoctor, normalizeAppointmentTime } from "./bookingParser.js";
 
 const promptPath = new URL("../../prompts/dental_admin_system_prompt.md", import.meta.url);
 const knowledgePath = new URL("../../prompts/clinic_knowledge.md", import.meta.url);
@@ -21,6 +22,7 @@ const structuredOutputPrompt = `
   "handoff_reason": null,
   "memory_update": {
     "patient_name": null,
+    "patient_name_source": null,
     "phone": null,
     "intent": null,
     "preferred_time": null,
@@ -29,7 +31,8 @@ const structuredOutputPrompt = `
     "requested_service": null,
     "preferred_doctor": null,
     "urgency": null,
-    "consent_to_book": null
+    "consent_to_book": null,
+    "clear_fields": []
   }
 }
 
@@ -40,6 +43,8 @@ const structuredOutputPrompt = `
 - Если есть тревожные симптомы, should_handoff = true.
 - should_create_appointment_request = true только когда заявка достаточно собрана.
 - В memory_update записывай только факты из диалога, не выдумывай телефон, дату, врача или услугу.
+- patient_name заполняй только если клиент явно назвал себя ("меня зовут", "моё имя", "запишите на имя") или это имя профиля канала; тогда patient_name_source="explicit_user_name" или "channel_profile". Имя врача не является patient_name.
+- Если клиент явно отменяет или меняет уже известный слот/врача/дату/время, не ставь поле в null. Используй clear_fields: ["preferred_doctor"|"preferred_date"|"preferred_time"|"time_constraint"|"requested_service"].
 - Не повторяй полное имя клиента в каждом ответе. Если нужно обратиться, используй имя без фамилии.
 - Пиши естественно: 1-3 коротких предложения, без одинаковых шаблонов подряд.
 `;
@@ -75,12 +80,15 @@ const productionOutputPrompt = `
   "urgency": "low|medium|high",
   "memory_patch": {
     "name": null,
+    "patient_name_source": null,
     "phone": null,
     "service": null,
     "complaint": null,
     "preferred_date": null,
     "preferred_time": null,
-    "status": null
+    "preferred_doctor": null,
+    "status": null,
+    "clear_fields": []
   }
 }
 
@@ -94,6 +102,8 @@ const productionOutputPrompt = `
 - Если данных не хватает, задай один следующий вопрос.
 - Сначала отвечай на конкретный вопрос клиента. Не превращай вопросы про врачей, цены, консультацию или "когда можно" в запись.
 - Запись можно предлагать мягко, но create_appointment ставь только если клиент явно подтвердил запись: "запишите меня", "хочу записаться", "да, запишите", "подходит, запишите", "запишите на четверг в 15:00".
+- Не записывай имя врача в name/patient_name. Если имя рядом со словами "врач", "доктор", "специалист", "к врачу", "к доктору" или после "к/ко", это doctor/preferred_doctor.
+- Если клиент поправляет сохраненную деталь ("не к Дмитрию", "другой врач", "не завтра", "другое время"), в memory_patch/memory_update укажи clear_fields с нужными полями вместо null.
 - Не начинай каждый ответ одинаковым приветствием. Избегай частого "чем могу помочь" и "что вас интересует".
 - Если пользователь грубит, провоцирует, пишет мусор или сексуальные сообщения, не отвечай по теме провокации. Если это жалоба или злость из-за записи, признай проблему и предложи передать администратору. Если это непонятное сообщение, попроси написать чуть подробнее.
 - Отличай стоматологическую услугу от отмены записи. "Удалить зуб", "удаление зуба", "удалить зуб мудрости", "вырвать зуб", "зуб мудрости удалить" = услуга tooth_extraction/wisdom_tooth_extraction, а не cancel. Cancel только когда клиент явно говорит про запись, прием, визит или бронь: "удалите запись", "отмените прием", "не приду", "запись не нужна".
@@ -327,16 +337,19 @@ function normalizeClassifierOutput(parsed = {}, userMessage = "", events = []) {
     complaint: entities.complaint || (isBookingLikeIntent(rawIntent) ? entities.service : null),
     preferred_date: normalizedDate,
     preferred_time: entities.time,
+    preferred_doctor: entities.doctor,
     status: stateFromClassifier(rawIntent, safeNextAction)
   });
   const memoryUpdate = compactObject({
     ...facts,
     patient_name: entities.name || facts.patient_name,
+    patient_name_source: facts.patient_name_source,
     phone: entities.phone || facts.phone,
     requested_service: entities.service || facts.requested_service,
     complaint: entities.complaint || facts.complaint || (isBookingLikeIntent(rawIntent) ? entities.service : null),
     preferred_date: normalizedDate || facts.preferred_date,
     preferred_time: entities.time || facts.preferred_time,
+    preferred_doctor: entities.doctor || facts.preferred_doctor,
     intent: isBookingLikeIntent(rawIntent) ? "book_appointment" : facts.intent,
     consent_to_book: flags.explicit_booking_confirmation === true ? true : facts.consent_to_book,
     status: memoryPatch.status
@@ -354,6 +367,7 @@ function normalizeClassifierOutput(parsed = {}, userMessage = "", events = []) {
     intent: mapClassifierIntent(rawIntent),
     classifier_intent: rawIntent,
     sub_intent: cleanText(parsed.sub_intent),
+    secondary_intents: normalizeSecondaryIntents(parsed.secondary_intents),
     confidence: normalizeConfidence(parsed.confidence),
     extracted: entities,
     flags: {
@@ -391,16 +405,23 @@ function normalizeClassifierDate(value) {
 
 function localClassifierFallback(userMessage = "", { events = [] } = {}) {
   const inferred = inferFromMessage(userMessage);
-  const intent = inferred.intent === "book_appointment"
-    ? "booking_request"
-    : (inferred.intent === "price_question" ? "pricing_question" : "unknown");
+  const intentMap = {
+    book_appointment: "booking_request",
+    price_question: "pricing_question",
+    service_question: "service_question",
+    medical_question: "medical_question",
+    consultation: "service_question"
+  };
+  const intent = intentMap[inferred.intent] || "unknown";
   return normalizeClassifierOutput({
     intent,
-    confidence: 0.35,
-    entities: {},
-    flags: {},
-    safe_next_action: intent === "booking_request" ? "collect_booking_data" : "answer_question",
-    risk: { risk_level: "low", risk_type: "none", should_handoff: false },
+    sub_intent: inferred.sub_intent || (intent === "pricing_question" ? "asks_price" : "none"),
+    secondary_intents: inferred.secondary_intents || [],
+    confidence: inferred.confidence || 0.35,
+    entities: inferred.entities || {},
+    flags: inferred.flags || {},
+    safe_next_action: inferred.safe_next_action || (intent === "booking_request" ? "collect_booking_data" : "answer_question"),
+    risk: inferred.risk || { risk_level: "low", risk_type: "none", should_handoff: false },
     reason: "local_classifier_fallback"
   }, userMessage, events);
 }
@@ -533,21 +554,43 @@ function cleanText(value) {
   return truncateText(text, 500);
 }
 
+function normalizeSecondaryIntents(value = []) {
+  const allowed = new Set([
+    "greeting",
+    "booking_request",
+    "pricing_question",
+    "service_question",
+    "doctor_question",
+    "medical_question",
+    "appointment_change",
+    "reschedule",
+    "cancel",
+    "complaint",
+    "abuse",
+    "noise",
+    "unknown"
+  ]);
+  if (!Array.isArray(value)) return [];
+  return [...new Set(
+    value
+      .map((item) => String(item || "").trim())
+      .filter((item) => allowed.has(item))
+  )];
+}
+
 function inferFromMessage(userMessage) {
   const lower = userMessage.toLowerCase();
-  const asksPrice = [
-    "цена",
-    "стоимость",
-    "сколько стоит",
-    "прайс",
-    "price",
-    "cost"
-  ].some((word) => lower.includes(word));
+  const asksPrice = hasLocalPriceSignal(lower);
+  const wisdomTooth = detectLocalWisdomToothContext(lower);
+  const medicalRisk = /(отек|отёк|температур|кровотеч|кровь\s+не\s+останавливается|травм|сильн.{0,20}бол|дышать\s+тяжело|глотать\s+тяжело|гной|инфекц)/iu.test(lower);
+  const asksWhatToDo = /((чо|че|чё|что)\s+делать|как\s+быть)/iu.test(lower);
   const hasPain = [
     "болит",
     "боль",
     "зуб",
     "ноет",
+    "режется",
+    "режутся",
     "десна",
     "tooth",
     "teeth",
@@ -568,10 +611,70 @@ function inferFromMessage(userMessage) {
   ].some((word) => lower.includes(word));
   const saysHelloOnly = /^(здравствуйте|здравствуй|добрый день|добрый вечер|привет)[!. ]*$/i.test(lower.trim());
 
+  if (wisdomTooth.detected && medicalRisk) {
+    return {
+      intent: "medical_question",
+      sub_intent: "medical_risk",
+      confidence: 0.82,
+      secondary_intents: asksPrice ? ["pricing_question", "service_question"] : ["service_question"],
+      entities: wisdomTooth.entities,
+      flags: {
+        is_dental_service: true,
+        is_cancel_appointment: false,
+        is_medical_risk: true,
+        needs_admin: true
+      },
+      safe_next_action: "handoff_to_admin",
+      risk: { risk_level: "high", risk_type: "medical_risk", should_handoff: true }
+    };
+  }
+
+  if (wisdomTooth.detected && asksPrice) {
+    return {
+      intent: "price_question",
+      sub_intent: wisdomTooth.complaint ? "medical_context_price" : "asks_price",
+      confidence: 0.75,
+      secondary_intents: wisdomTooth.complaint || asksWhatToDo ? ["medical_question", "service_question"] : ["service_question"],
+      entities: wisdomTooth.entities,
+      flags: {
+        is_dental_service: true,
+        is_cancel_appointment: false,
+        is_medical_risk: false,
+        needs_admin: false
+      },
+      safe_next_action: "answer_question",
+      risk: { risk_level: "low", risk_type: "none", should_handoff: false }
+    };
+  }
+
+  if (wisdomTooth.detected && (asksWhatToDo || wisdomTooth.complaint)) {
+    return {
+      intent: "service_question",
+      sub_intent: "medical_context",
+      confidence: 0.7,
+      secondary_intents: ["medical_question"],
+      entities: wisdomTooth.entities,
+      flags: {
+        is_dental_service: true,
+        is_cancel_appointment: false,
+        is_medical_risk: false,
+        needs_admin: false
+      },
+      safe_next_action: "answer_question",
+      risk: { risk_level: "low", risk_type: "none", should_handoff: false }
+    };
+  }
+
   if (asksPrice && !wantsBooking) {
     return {
       intent: "price_question",
-      urgency: "low"
+      urgency: "low",
+      confidence: 0.55,
+      flags: {
+        is_cancel_appointment: false,
+        is_medical_risk: false,
+        needs_admin: false
+      }
     };
   }
 
@@ -617,6 +720,28 @@ function inferFromMessage(userMessage) {
   }
 
   return {};
+}
+
+function hasLocalPriceSignal(text = "") {
+  return /(по\s+бабк|как\s+по\s+бабк|как\s+по\s+деньг|по\s+деньгам|(?:^|\s)деньги(?:\s|$)|скок|скока|сколько|стоимост|стоить|стоит|цена|прайс|ценник|price|cost)/iu.test(String(text || ""));
+}
+
+function detectLocalWisdomToothContext(text = "") {
+  const lower = String(text || "").toLowerCase();
+  const wisdom = /(зуб(?:а|ы)?\s+мудрости|восьм[её]рк[а-я]*)/iu.test(lower);
+  if (!wisdom) return { detected: false, complaint: null, entities: {} };
+
+  const eruption = /(реж(?:е|у)тся|режется|лез(?:е|у)т|лезет|прорез(?:ыва)?[а-я]*)/iu.test(lower);
+  const complaint = eruption ? "режутся зубы мудрости" : null;
+  return {
+    detected: true,
+    complaint,
+    entities: {
+      service: "зубы мудрости",
+      service_category: "wisdom_tooth_extraction",
+      complaint
+    }
+  };
 }
 
 function improveAgentResult(result, userMessage) {
@@ -695,19 +820,20 @@ function extractFactsFromMessage(userMessage) {
     /(?:меня зовут|мое имя|моё имя|имя)\s+([А-ЯЁA-Z][А-ЯЁа-яёA-Za-z-]{1,40})/u,
     /меня\s+([А-ЯЁA-Z][А-ЯЁа-яёA-Za-z-]{1,40})\s+зовут/u,
     /зовут\s+меня\s+([А-ЯЁA-Z][А-ЯЁа-яёA-Za-z-]{1,40})/u,
+    /запишите\s+(?:на\s+имя|меня\s+как)\s+([А-ЯЁA-Z][А-ЯЁа-яёA-Za-z-]{1,40})/u,
     /^я\s+([А-ЯЁA-Z][А-ЯЁа-яёA-Za-z-]{1,40})$/u
   ];
   const nameMatch = namePatterns.map((pattern) => text.match(pattern)).find(Boolean);
   if (nameMatch) {
     facts.patient_name = normalizeName(nameMatch[1]);
+    facts.patient_name_source = "explicit_user_name";
   }
 
-  const timeMatch = text.match(/(?:\bв|\bна|после)\s*(\d{1,2})(?::(\d{2}))?/u);
-  if (timeMatch) {
-    const hours = timeMatch[1].padStart(2, "0");
-    const minutes = timeMatch[2] || "00";
-    facts.preferred_time = `${hours}:${minutes}`;
-  }
+  const doctor = extractPreferredDoctor(text);
+  if (doctor) facts.preferred_doctor = doctor;
+
+  const appointmentTime = normalizeAppointmentTime(text);
+  if (appointmentTime) facts.preferred_time = appointmentTime;
 
   if (lower.includes("завтра")) {
     facts.preferred_date = addDaysIso(1);

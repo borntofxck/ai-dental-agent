@@ -746,7 +746,46 @@ async function processQueuedMessage() {
 
   try {
     const n8nResponse = await sendIncomingMessageToN8n(payload);
-    const reply = cleanReplyForMessenger(n8nResponse);
+    let reply = cleanReplyForMessenger(n8nResponse);
+    let recoveredDuplicateReply = false;
+    if (!reply && n8nResponse?.skipped && n8nResponse.reason === "duplicate_latest_incoming_text") {
+      const latestOutgoing = n8nResponse.conversation_id
+        ? await prisma.message.findFirst({
+            where: {
+              conversationId: Number(n8nResponse.conversation_id),
+              direction: "outgoing"
+            },
+            orderBy: { createdAt: "desc" }
+          })
+        : null;
+      reply = cleanReplyForMessenger({ reply: latestOutgoing?.text || "" });
+      recoveredDuplicateReply = Boolean(reply);
+    }
+
+    if (!reply && n8nResponse?.skipped) {
+      await prisma.maxMessageQueue.update({
+        where: { id: item.id },
+        data: {
+          status: "skipped",
+          n8nResponse,
+          processedAt: new Date(),
+          sentAt: null,
+          lockedUntil: null,
+          lastError: n8nResponse.reason || "skipped_without_reply",
+          updatedAt: new Date()
+        }
+      });
+
+      return {
+        ok: true,
+        skipped: true,
+        queue_id: item.id,
+        chat_id: item.chatId,
+        reason: n8nResponse.reason || "skipped_without_reply",
+        queue: await getQueueStats()
+      };
+    }
+
     if (reply) {
       await maxClient.openChatByChatId(item.chatId);
       await maxClient.sendMessage(item.chatId, reply);
@@ -762,7 +801,9 @@ async function processQueuedMessage() {
       where: { id: item.id },
       data: {
         status: "sent",
-        n8nResponse,
+        n8nResponse: recoveredDuplicateReply
+          ? { ...n8nResponse, recovered_duplicate_reply: true, recovered_reply: reply }
+          : n8nResponse,
         processedAt: new Date(),
         sentAt: reply ? new Date() : null,
         lockedUntil: null,

@@ -430,6 +430,59 @@ export function createAdminRouter() {
     res.json({ ok: true, handoff });
   });
 
+  router.post("/conversations/:id/reset-context", async (req, res) => {
+    const conversationId = Number(req.params.id);
+    const conversation = await prisma.conversation.findUnique({
+      where: { id: conversationId },
+      include: { contact: true }
+    });
+
+    if (!conversation) {
+      res.status(404).json({ ok: false, error: "conversation_not_found" });
+      return;
+    }
+
+    const maxUserId = conversation.contact?.maxUserId || null;
+    await prisma.$transaction([
+      prisma.conversationMemory.deleteMany({
+        where: { conversationId }
+      }),
+      prisma.handoff.updateMany({
+        where: { conversationId, status: "open" },
+        data: {
+          status: "resolved",
+          resolvedAt: new Date()
+        }
+      }),
+      prisma.conversation.update({
+        where: { id: conversationId },
+        data: {
+          status: "closed_context_reset",
+          updatedAt: new Date()
+        }
+      }),
+      ...(maxUserId ? [
+        prisma.maxChatState.updateMany({
+          where: { chatId: maxUserId },
+          data: {
+            lastPreviewText: null,
+            lastDirection: null,
+            cooldownUntil: null,
+            updatedAt: new Date()
+          }
+        })
+      ] : [])
+    ]);
+
+    res.json({
+      ok: true,
+      conversation_id: conversationId,
+      contact_id: conversation.contactId,
+      max_user_id: maxUserId,
+      status: "closed_context_reset"
+    });
+  });
+
   router.get("/prompts", async (req, res) => {
     const [systemPrompt, clinicKnowledge] = await Promise.all([
       readFile(systemPromptPath, "utf8"),

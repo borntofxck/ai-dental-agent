@@ -4,8 +4,10 @@ import {
   buildClinicDateTime as buildParsedClinicDateTime,
   extractBookingFacts,
   formatDateForReply as formatBookingDateForReply,
+  getAmbiguousAppointmentTimeClarification,
   getMissingAppointmentFields,
   isBookingIntent,
+  isBookingConfirmationText,
   normalizeAppointmentDate,
   normalizeAppointmentTime,
   normalizeBookingMemory,
@@ -13,6 +15,16 @@ import {
 } from "./bookingParser.js";
 import { config } from "./config.js";
 import { prisma } from "./db.js";
+import {
+  extractExplicitPatientName,
+  findKnownClinicPersonByName,
+  findKnownDoctorMention,
+  isKnownClinicPersonName,
+  isNameInDoctorContext,
+  namesReferToSameKnownPerson,
+  normalizeName,
+  normalizeNameKey
+} from "./nameRole.js";
 import { sanitizeReplyForUser } from "./replySanitizer.js";
 
 const RESPONSE_DEBOUNCE_MS = 8000;
@@ -31,16 +43,176 @@ const CONVERSATION_STATES = new Set([
   "handoff_required"
 ]);
 
+const BOOKING_STATE_STATUSES = new Set([
+  "collecting_info",
+  "suggesting_slot",
+  "awaiting_confirmation",
+  "confirmed",
+  "handoff_required"
+]);
+
+const MEMORY_CLEAR_FIELD_MAP = {
+  preferred_doctor: ["preferred_doctor"],
+  doctor: ["preferred_doctor"],
+  preferred_date: ["preferred_date"],
+  date: ["preferred_date"],
+  preferred_time: ["preferred_time"],
+  time: ["preferred_time"],
+  time_constraint: ["time_constraint"],
+  requested_service: ["requested_service"],
+  service: ["requested_service"],
+  complaint: ["complaint"],
+  patient_name: ["patient_name"],
+  phone: ["phone"]
+};
+
+const BOOKING_STATE_CLEAR_FIELD_MAP = {
+  preferred_doctor: ["doctor"],
+  doctor: ["doctor"],
+  preferred_date: ["date"],
+  date: ["date"],
+  preferred_time: ["time"],
+  time: ["time"],
+  time_constraint: ["time_constraint"],
+  requested_service: ["service"],
+  service: ["service"],
+  complaint: ["complaint"],
+  patient_name: ["patient_name"],
+  phone: ["phone"],
+  contact: ["contact"]
+};
+
+const BOOKING_CONFIRMATION_INVALIDATING_FIELDS = new Set([
+  "preferred_doctor",
+  "doctor",
+  "preferred_date",
+  "date",
+  "preferred_time",
+  "time",
+  "time_constraint",
+  "requested_service",
+  "service"
+]);
+
+const TRUSTED_PATIENT_NAME_SOURCES = new Set(["explicit_user_name", "channel_profile"]);
+
 function normalizeChannel(channel) {
   return (cleanScalar(channel) || "MAX").toUpperCase();
 }
 
-function mergeMemory(currentMemory, ...updates) {
+export function mergeMemory(currentMemory, ...updates) {
+  const merged = { ...(currentMemory || {}) };
+
+  for (const update of updates.filter(Boolean)) {
+    const clearFields = normalizeClearFields(
+      update.clear_fields,
+      update.unset_fields,
+      update.null_fields,
+      isPlainObject(update.booking_state) ? update.booking_state.clear_fields : null,
+      isPlainObject(update.booking_state) ? update.booking_state.unset_fields : null,
+      isPlainObject(update.booking_state) ? update.booking_state.null_fields : null
+    );
+    if (clearFields.length) {
+      applyMemoryFieldClears(merged, clearFields);
+    }
+
+    for (const [key, value] of Object.entries(update)) {
+      if (["clear_fields", "unset_fields", "null_fields"].includes(key)) continue;
+      if (value === null || value === undefined || value === "") continue;
+      if (key === "booking_state" && isPlainObject(value)) {
+        merged.booking_state = mergeBookingState(merged.booking_state, value);
+        continue;
+      }
+
+      merged[key] = value;
+    }
+  }
+
+  if (isPlainObject(merged.booking_state)) {
+    merged.booking_state = mergeBookingState(merged.booking_state);
+  }
+
   return Object.fromEntries(
-    Object.entries({
-      ...(currentMemory || {}),
-      ...Object.assign({}, ...updates.filter(Boolean))
-    }).filter(([, value]) => value !== null && value !== undefined && value !== "")
+    Object.entries(merged).filter(([, value]) => value !== null && value !== undefined && value !== "")
+  );
+}
+
+function applyMemoryFieldClears(memory = {}, clearFields = []) {
+  const normalizedFields = normalizeClearFields(clearFields);
+
+  for (const field of normalizedFields) {
+    for (const memoryField of MEMORY_CLEAR_FIELD_MAP[field] || []) {
+      delete memory[memoryField];
+    }
+  }
+
+  if (normalizedFields.some((field) => BOOKING_CONFIRMATION_INVALIDATING_FIELDS.has(field))) {
+    delete memory.consent_to_book;
+    if (memory.status === "waiting_booking_confirmation" || memory.status === "appointment_booked") {
+      memory.status = "collecting_booking_data";
+    }
+  }
+
+  if (isPlainObject(memory.booking_state)) {
+    memory.booking_state = mergeBookingState(memory.booking_state, { clear_fields: normalizedFields });
+  }
+}
+
+function isPlainObject(value) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function normalizeClearFields(...values) {
+  return [...new Set(values.flatMap((value) => {
+    if (!value) return [];
+    if (Array.isArray(value)) return value;
+    return String(value).split(/[,\s]+/u);
+  }).map((field) => String(field || "").trim()).filter(Boolean))];
+}
+
+export function mergeBookingState(currentState = {}, ...updates) {
+  const next = isPlainObject(currentState) ? { ...currentState } : {};
+
+  for (const update of updates.filter(isPlainObject)) {
+    const clearFields = normalizeClearFields(update.clear_fields, update.unset_fields, update.null_fields);
+    for (const field of clearFields) {
+      for (const stateField of BOOKING_STATE_CLEAR_FIELD_MAP[field] || []) {
+        delete next[stateField];
+      }
+    }
+
+    if (clearFields.some((field) => BOOKING_CONFIRMATION_INVALIDATING_FIELDS.has(field))) {
+      next.status = "collecting_info";
+      const missingFields = new Set(Array.isArray(next.missing_fields) ? next.missing_fields : []);
+      for (const field of clearFields) {
+        const stateField = (BOOKING_STATE_CLEAR_FIELD_MAP[field] || [])[0];
+        if (stateField) missingFields.add(stateField);
+      }
+      next.missing_fields = [...missingFields];
+    }
+
+    for (const [key, value] of Object.entries(update)) {
+      if (["clear_fields", "unset_fields", "null_fields"].includes(key)) continue;
+      if (value === null || value === undefined || value === "") continue;
+
+      if (["missing_fields", "secondary_intents"].includes(key) && Array.isArray(value)) {
+        next[key] = [...new Set(value.filter(Boolean))];
+        continue;
+      }
+
+      if (["asked_fields", "history"].includes(key) && Array.isArray(value)) {
+        const previous = Array.isArray(next[key]) ? next[key] : [];
+        next[key] = [...previous, ...value].filter(Boolean).slice(-12);
+        continue;
+      }
+
+      if (key === "status" && !BOOKING_STATE_STATUSES.has(value)) continue;
+      next[key] = value;
+    }
+  }
+
+  return Object.fromEntries(
+    Object.entries(next).filter(([, value]) => value !== null && value !== undefined && value !== "")
   );
 }
 
@@ -64,6 +236,23 @@ function cleanOptional(value) {
   return cleanScalar(value) || null;
 }
 
+function normalizeAppointmentPhone(value) {
+  const text = cleanScalar(value);
+  if (!text) return null;
+  const digits = text.replace(/\D/g, "");
+  if (digits.length < 10 || digits.length > 15) return null;
+  if (text.trim().startsWith("+")) return `+${digits}`;
+  if (digits.length === 11 && digits[0] === "8") return `+7${digits.slice(1)}`;
+  if (digits.length === 10 && digits[0] === "9") return `+7${digits}`;
+  return digits;
+}
+
+function truncateDbString(value, maxLength) {
+  const text = cleanScalar(value);
+  if (!text) return null;
+  return text.length > maxLength ? text.slice(0, maxLength) : text;
+}
+
 function normalizeIncomingPayload(payload = {}) {
   const messageText = cleanIncomingText(payload.message_text);
   const maxUserId = cleanScalar(payload.max_user_id);
@@ -79,6 +268,319 @@ function normalizeIncomingPayload(payload = {}) {
     external_message_id: cleanOptional(payload.external_message_id || payload.externalMessageId),
     message_text: messageText
   };
+}
+
+function normalizeChannelProfileName(value = "") {
+  const name = normalizeName(value);
+  if (!name || isKnownClinicPersonName(name)) return null;
+  return name;
+}
+
+function getSafePatientName(memory = {}, payload = {}, fallbackName = "") {
+  const explicitName = normalizeName(memory.patient_name || memory.booking_state?.patient_name || "");
+  const explicitSource = memory.patient_name_source || memory.booking_state?.patient_name_source || null;
+  if (explicitName && TRUSTED_PATIENT_NAME_SOURCES.has(explicitSource) && !isKnownClinicPersonName(explicitName)) {
+    return explicitName;
+  }
+
+  const fallback = normalizeName(fallbackName);
+  if (fallback && !isKnownClinicPersonName(fallback)) return fallback;
+
+  return normalizeChannelProfileName(payload.display_name);
+}
+
+function getSafePatientPrefix(memory = {}, payload = {}, fallbackName = "") {
+  const name = getSafePatientName(memory, payload, fallbackName);
+  return name ? `${shortName(name)}, ` : "";
+}
+
+function stripUnsafeDoctorAddressing(reply = "", { memory = {}, payload = {} } = {}) {
+  const text = String(reply || "").trim();
+  if (!text) return text;
+
+  const safeName = getSafePatientName(memory, payload);
+  const prefix = text.match(/^([^,!.?]{2,80}),\s+/u);
+  if (!prefix) return text;
+
+  const addressedName = normalizeName(prefix[1]);
+  if (safeName && normalizeNameKey(addressedName) === normalizeNameKey(safeName)) return text;
+  if (isKnownClinicPersonName(addressedName) || namesReferToSameKnownPerson(addressedName, memory.preferred_doctor || memory.booking_state?.doctor || "")) {
+    return text.slice(prefix[0].length).trimStart();
+  }
+
+  return text;
+}
+
+function hasActiveBookingState(memory = {}) {
+  const state = memory.booking_state || {};
+  return Boolean(
+    memory.status === "collecting_booking_data" ||
+    memory.status === "waiting_booking_confirmation" ||
+    state.status === "collecting_info" ||
+    state.status === "suggesting_slot" ||
+    state.status === "awaiting_confirmation" ||
+    memory.intent === "book_appointment" ||
+    state.intent === "book_appointment" ||
+    memory.requested_service ||
+    memory.complaint ||
+    memory.preferred_date ||
+    memory.preferred_time ||
+    memory.preferred_doctor ||
+    memory.time_constraint ||
+    state.service ||
+    state.date ||
+    state.time ||
+    state.doctor ||
+    state.time_constraint
+  );
+}
+
+function isAwaitingBookingConfirmation(memory = {}) {
+  return memory.status === "waiting_booking_confirmation" ||
+    memory.booking_state?.status === "awaiting_confirmation" ||
+    memory.booking_state?.status === "suggesting_slot";
+}
+
+function enrichMemoryWithBookingState(memory = {}, {
+  previousMemory = {},
+  payload = {},
+  bookingIntent = false,
+  appointmentValidation = null,
+  appointmentRequest = null,
+  activeAppointment = null,
+  slotConflict = null,
+  agentResult = {},
+  missingFields = null
+} = {}) {
+  const previousState = memory.booking_state || previousMemory.booking_state || {};
+  const payloadMaxUserId = payload.max_user_id || payload.maxUserId || null;
+  const previousPhone = previousState.phone === payloadMaxUserId ? null : previousState.phone;
+  const payloadProfileName = normalizeChannelProfileName(payload.display_name);
+  const patientName = memory.patient_name || previousState.patient_name || payloadProfileName;
+  const patientNameSource = memory.patient_name_source ||
+    previousState.patient_name_source ||
+    (payloadProfileName && patientName === payloadProfileName ? "channel_profile" : null);
+  const shouldTrackBooking = bookingIntent ||
+    hasActiveBookingState(memory) ||
+    hasActiveBookingState(previousMemory) ||
+    Boolean(appointmentValidation || appointmentRequest || activeAppointment || slotConflict || agentResult.should_handoff);
+
+  if (!shouldTrackBooking) return memory;
+
+  const normalizedDate = normalizeAppointmentDate(memory.preferred_date);
+  const normalizedTime = normalizeAppointmentTime(memory.preferred_time);
+  const legacyStatus = memory.status || previousMemory.status || null;
+  let status = resolveBookingStateStatus({
+    previousStatus: previousState.status,
+    legacyStatus,
+    bookingIntent,
+    appointmentValidation,
+    appointmentRequest,
+    activeAppointment,
+    slotConflict,
+    agentResult
+  });
+  if (
+    bookingIntent &&
+    memory.consent_to_book !== true &&
+    status === "collecting_info" &&
+    hasConcreteBookingProposal({
+      ...memory,
+      booking_state: mergeBookingState(previousState, {
+        service: memory.requested_service || previousState.service,
+        doctor: memory.preferred_doctor || previousState.doctor,
+        date: normalizedDate ? toBookingIsoDate(normalizedDate) : previousState.date,
+        time: normalizedTime || previousState.time
+      })
+    })
+  ) {
+    status = "awaiting_confirmation";
+  }
+  const mappedMissingFields = mapMissingFieldsToBookingState(
+    missingFields || appointmentValidation?.missing_fields || previousState.missing_fields || []
+  );
+
+  const bookingState = mergeBookingState(previousState, {
+    intent: memory.intent || previousState.intent || (bookingIntent || hasActiveBookingState(memory) ? "book_appointment" : null),
+    service: memory.requested_service || previousState.service,
+    doctor: memory.preferred_doctor || previousState.doctor,
+    date: normalizedDate ? toBookingIsoDate(normalizedDate) : previousState.date,
+    time: normalizedTime || previousState.time,
+    time_constraint: memory.time_constraint || previousState.time_constraint,
+    patient_name: patientName,
+    patient_name_source: patientNameSource,
+    phone: normalizeAppointmentPhone(memory.phone) || normalizeAppointmentPhone(previousPhone) || normalizeAppointmentPhone(payload.phone),
+    contact: previousState.contact || payloadMaxUserId,
+    complaint: memory.complaint || previousState.complaint,
+    status,
+    missing_fields: mappedMissingFields
+  });
+
+  const next = { ...memory, booking_state: bookingState };
+  if (bookingState.intent && !next.intent) next.intent = bookingState.intent;
+  if (bookingState.service && !next.requested_service) next.requested_service = bookingState.service;
+  if (bookingState.complaint && !next.complaint) next.complaint = bookingState.complaint;
+  if (bookingState.doctor && !next.preferred_doctor) next.preferred_doctor = bookingState.doctor;
+  if (bookingState.date && !next.preferred_date) next.preferred_date = bookingState.date;
+  if (bookingState.time && !next.preferred_time) next.preferred_time = bookingState.time;
+  if (bookingState.time_constraint && !next.time_constraint) next.time_constraint = bookingState.time_constraint;
+  if (bookingState.patient_name && !next.patient_name && bookingState.patient_name !== payload.display_name) {
+    next.patient_name = bookingState.patient_name;
+  }
+  if (bookingState.patient_name_source && !next.patient_name_source && next.patient_name) {
+    next.patient_name_source = bookingState.patient_name_source;
+  }
+  if (bookingState.phone && !next.phone && bookingState.phone !== payloadMaxUserId) {
+    next.phone = bookingState.phone;
+  }
+
+  return normalizeBookingMemory(next);
+}
+
+function resolveBookingStateStatus({
+  previousStatus = null,
+  legacyStatus = null,
+  bookingIntent = false,
+  appointmentValidation = null,
+  appointmentRequest = null,
+  activeAppointment = null,
+  slotConflict = null,
+  agentResult = {}
+} = {}) {
+  if (agentResult.should_handoff || legacyStatus === "handoff_required" || legacyStatus === "human_takeover") return "handoff_required";
+  if (appointmentRequest?.status === "confirmed" || appointmentValidation?.allowed || activeAppointment?.status === "confirmed") return "confirmed";
+  if (slotConflict) return "collecting_info";
+  if (appointmentValidation?.missing_fields?.length === 1 && appointmentValidation.missing_fields.includes("consent_to_book")) return "awaiting_confirmation";
+  if (legacyStatus === "waiting_booking_confirmation") return "awaiting_confirmation";
+  if (legacyStatus === "collecting_booking_data" || bookingIntent) return "collecting_info";
+  if (BOOKING_STATE_STATUSES.has(previousStatus)) return previousStatus;
+  return null;
+}
+
+function mapMissingFieldsToBookingState(missingFields = []) {
+  const mapping = {
+    reason: "service",
+    preferred_doctor: "doctor",
+    preferred_date: "date",
+    preferred_time: "time",
+    consent_to_book: "confirmation",
+    contact: "phone",
+    patient_name: "patient_name"
+  };
+  return [...new Set((missingFields || []).map((field) => mapping[field] || field).filter(Boolean))];
+}
+
+function normalizeBookingMissingFieldsForState(missingFields = [], { memory = {}, payload = {}, bookingIntent = false } = {}) {
+  const withoutConfirmation = [...new Set(missingFields || [])].filter((field) => field !== "consent_to_book");
+  if (!getSafePatientName(memory, payload) && !withoutConfirmation.includes("patient_name")) {
+    withoutConfirmation.push("patient_name");
+  }
+  if (!bookingIntent) return withoutConfirmation;
+
+  const hasService = isBookingFieldPresent("reason", memory, payload);
+  const hasDate = isBookingFieldPresent("preferred_date", memory, payload);
+  const hasTime = isBookingFieldPresent("preferred_time", memory, payload);
+  const hasDoctor = isBookingFieldPresent("preferred_doctor", memory, payload);
+  const explicitConfirmation = memory.consent_to_book === true;
+
+  if (!explicitConfirmation && hasService && hasDate && hasTime && !hasDoctor) {
+    return [...new Set([...withoutConfirmation, "preferred_doctor"])];
+  }
+
+  if (shouldRequireBookingConfirmation({ memory, missingFields: withoutConfirmation, bookingIntent })) {
+    return [...new Set([...withoutConfirmation, "consent_to_book"])];
+  }
+
+  return withoutConfirmation;
+}
+
+function shouldRequireBookingConfirmation({ memory = {}, missingFields = [], bookingIntent = false } = {}) {
+  if (!bookingIntent || memory.consent_to_book === true) return false;
+  if ((missingFields || []).filter((field) => field !== "consent_to_book").length > 0) return false;
+  const state = memory.booking_state || {};
+  const statusAllowsConfirmation = state.status === "awaiting_confirmation" || memory.status === "waiting_booking_confirmation";
+  return statusAllowsConfirmation && hasConcreteBookingProposal(memory);
+}
+
+function hasConcreteBookingProposal(memory = {}) {
+  return Boolean(
+    (memory.requested_service || memory.complaint || memory.booking_state?.service || memory.booking_state?.complaint) &&
+    normalizeAppointmentDate(memory.preferred_date || memory.booking_state?.date) &&
+    normalizeAppointmentTime(memory.preferred_time || memory.booking_state?.time) &&
+    (memory.preferred_doctor || memory.booking_state?.doctor)
+  );
+}
+
+function filterMissingBookingFieldsForReply(missingFields = [], { memory = {}, payload = {}, recentMessages = [] } = {}) {
+  const stillMissing = [...new Set(missingFields || [])].filter((field) => !isBookingFieldPresent(field, memory, payload));
+  const notRecentlyAsked = stillMissing.filter((field) => !wasBookingFieldAskedRecently(field, recentMessages));
+  return notRecentlyAsked.length ? notRecentlyAsked : stillMissing;
+}
+
+function isBookingFieldPresent(field, memory = {}, payload = {}) {
+  const state = memory.booking_state || {};
+  const payloadMaxUserId = payload.max_user_id || payload.maxUserId || null;
+  if (field === "patient_name") return Boolean(getSafePatientName(memory, payload));
+  if (field === "contact") return Boolean(normalizeAppointmentPhone(memory.phone) || normalizeAppointmentPhone(state.phone) || normalizeAppointmentPhone(payload.phone) || state.contact || payloadMaxUserId);
+  if (field === "reason") return Boolean(memory.requested_service || memory.complaint || state.service || state.complaint);
+  if (field === "preferred_doctor") return Boolean(memory.preferred_doctor || state.doctor);
+  if (field === "preferred_date") return Boolean(normalizeAppointmentDate(memory.preferred_date || state.date));
+  if (field === "preferred_time") return Boolean(normalizeAppointmentTime(memory.preferred_time || state.time));
+  if (field === "consent_to_book") return memory.consent_to_book === true;
+  return false;
+}
+
+function wasBookingFieldAskedRecently(field, recentMessages = []) {
+  const stateField = mapMissingFieldsToBookingState([field])[0];
+  const recentAssistantTexts = (recentMessages || [])
+    .filter((message) => message.role === "assistant" || message.direction === "outgoing")
+    .slice(-3)
+    .map((message) => String(message.text || "").toLowerCase());
+
+  return recentAssistantTexts.some((text) => {
+    if (stateField === "service") return /(что беспокоит|какую услугу|на какую услугу)/iu.test(text);
+    if (stateField === "date") return /(какой день|на какой день|дата|когда)/iu.test(text);
+    if (stateField === "time") return /(какое время|на какое время|во сколько|точное время)/iu.test(text);
+    if (stateField === "doctor") return /(к какому врачу|какой врач|врач)/iu.test(text);
+    if (stateField === "confirmation") return /(подтверд|записать вас|подтверждаете)/iu.test(text);
+    if (stateField === "phone") return /(телефон|номер|контакт)/iu.test(text);
+    if (stateField === "patient_name") return /(как вас зовут|имя|зовут)/iu.test(text);
+    return false;
+  });
+}
+
+function recordBookingStateTurn(memory = {}, { reply = "", missingFields = [] } = {}) {
+  if (!hasActiveBookingState(memory) && !memory.booking_state) return memory;
+  const askedFields = inferAskedBookingFields(reply, missingFields);
+  if (!askedFields.length) return memory;
+
+  const now = new Date().toISOString();
+  const entries = askedFields.map((field) => ({
+    field,
+    at: now,
+    question: String(reply || "").slice(0, 180)
+  }));
+
+  return {
+    ...memory,
+    booking_state: mergeBookingState(memory.booking_state, {
+      asked_fields: entries,
+      history: [{ role: "assistant", text: String(reply || "").slice(0, 240), at: now }]
+    })
+  };
+}
+
+function inferAskedBookingFields(reply = "", missingFields = []) {
+  const lower = String(reply || "").toLowerCase();
+  const fields = new Set(mapMissingFieldsToBookingState(missingFields));
+  if (/(что беспокоит|какую услугу|на какую услугу)/iu.test(lower)) fields.add("service");
+  if (/(какой день|на какой день|дата|когда)/iu.test(lower)) fields.add("date");
+  if (/(какое время|на какое время|во сколько|точное время)/iu.test(lower)) fields.add("time");
+  if (/(к какому врачу|какой врач)/iu.test(lower)) fields.add("doctor");
+  if (/(подтверд|записать вас|подтверждаете)/iu.test(lower)) fields.add("confirmation");
+  if (/(телефон|номер|контакт)/iu.test(lower)) fields.add("phone");
+  if (/(как вас зовут|имя|зовут)/iu.test(lower)) fields.add("patient_name");
+  return [...fields].filter(Boolean);
 }
 
 async function findOrCreateConversation(contactId, channel) {
@@ -354,6 +856,45 @@ export async function processIncomingMessage(input) {
   });
 
   if (isConversationInHumanTakeover(conversation)) {
+    const takeoverMemoryRow = await prisma.conversationMemory.findUnique({
+      where: { conversationId: conversation.id }
+    });
+    const latestOpenHandoff = await prisma.handoff.findFirst({
+      where: { conversationId: conversation.id, status: "open" },
+      orderBy: { createdAt: "desc" }
+    });
+    const canResumeAi = canResumeAiFromHumanTakeover(messageText, {
+      memory: takeoverMemoryRow?.memory || {},
+      conversation,
+      latestHandoff: latestOpenHandoff
+    });
+
+    if (canResumeAi) {
+      const resumedMemory = {
+        ...clearStaleBookingMemory(takeoverMemoryRow?.memory || {}),
+        status: getResumeMemoryStatus(messageText)
+      };
+      await prisma.conversationMemory.upsert({
+        where: { conversationId: conversation.id },
+        update: {
+          memory: resumedMemory,
+          updatedAt: new Date()
+        },
+        create: {
+          conversationId: conversation.id,
+          memory: resumedMemory
+        }
+      });
+      await prisma.handoff.updateMany({
+        where: { conversationId: conversation.id, status: "open" },
+        data: {
+          status: "resolved",
+          resolvedAt: new Date()
+        }
+      });
+      await returnConversationToAI({ conversationId: conversation.id });
+      conversation.status = "active";
+    } else {
     const events = [
       {
         type: "ai_disabled_after_handoff",
@@ -382,6 +923,7 @@ export async function processIncomingMessage(input) {
       conversation_id: conversation.id,
       incoming_message_id: incomingMessage.id
     };
+    }
   }
 
   const memoryRow = await prisma.conversationMemory.findUnique({
@@ -403,14 +945,31 @@ export async function processIncomingMessage(input) {
   });
   let baseMemory = activeAppointment
     ? memoryRow?.memory || {}
-    : clearStaleBookingMemory(memoryRow?.memory || {});
+    : normalizeBookingMemory(memoryRow?.memory || {});
+  baseMemory = enrichMemoryWithBookingState(baseMemory, {
+    previousMemory: memoryRow?.memory || {},
+    payload,
+    activeAppointment
+  });
   const hardGuardIntent = detectConversationIntent(messageText);
+  const actionableBookingCorrection = isActionableBookingCorrection(messageText, {
+    memory: baseMemory,
+    activeAppointment
+  });
 
   if (
     !activeAppointment &&
     baseMemory.status === "cancellation_requested" &&
     hardGuardIntent.intent === "message" &&
     hasExplicitBookingRequest(messageText)
+  ) {
+    baseMemory = { ...clearAppointmentDraft(baseMemory), status: "collecting_booking_data" };
+  }
+
+  if (
+    !activeAppointment &&
+    ["handoff_required", "human_takeover"].includes(baseMemory.status) &&
+    actionableBookingCorrection
   ) {
     baseMemory = { ...clearAppointmentDraft(baseMemory), status: "collecting_booking_data" };
   }
@@ -423,9 +982,12 @@ export async function processIncomingMessage(input) {
     conversationState: baseMemory.status || (activeAppointment?.status === "confirmed" ? "appointment_booked" : "idle"),
     bookingDraft: {
       service: baseMemory.requested_service,
+      doctor: baseMemory.preferred_doctor,
       date: baseMemory.preferred_date,
       time: baseMemory.preferred_time,
-      status: baseMemory.status
+      time_constraint: baseMemory.time_constraint,
+      status: baseMemory.status,
+      booking_state: baseMemory.booking_state || null
     }
   });
   const riskAssessment = classifyConversationRisk({
@@ -474,19 +1036,35 @@ export async function processIncomingMessage(input) {
       guard: guardedTurn
     });
   }
-  const deterministicFacts = extractBookingFacts(messageText);
-  const explicitBookingConfirmation = hasExplicitBookingConfirmation(messageText);
+  const deterministicFacts = postValidateMemoryNameRoles(extractBookingFacts(messageText), {
+    messageText,
+    payload,
+    strictPatientSource: true
+  });
+  const awaitingBookingConfirmation = isAwaitingBookingConfirmation(baseMemory);
+  const explicitBookingConfirmation = hasExplicitBookingConfirmation(messageText) ||
+    (awaitingBookingConfirmation && isBookingConfirmationText(messageText));
   if (explicitBookingConfirmation) {
     deterministicFacts.consent_to_book = true;
   }
   const classifierBookingSignal = isClassifierBookingSignal(agentResult);
-  const currentMessageBookingSignal = conversationIntent.intent === "booking_request" || classifierBookingSignal || hasExplicitBookingRequest(messageText) || isBookingIntent({
-    text: messageText,
-    memory: deterministicFacts
-  });
+  const continuingBookingStateSignal = hasActiveBookingState(baseMemory) && (
+    hasActionableBookingFacts(deterministicFacts) ||
+    deterministicFacts.confirmation === true ||
+    explicitBookingConfirmation
+  );
+  const currentMessageBookingSignal = conversationIntent.intent === "booking_request" ||
+    classifierBookingSignal ||
+    actionableBookingCorrection ||
+    continuingBookingStateSignal ||
+    hasExplicitBookingRequest(messageText) ||
+    isBookingIntent({
+      text: messageText,
+      memory: deterministicFacts
+    });
   const safeMemoryUpdate = !activeAppointment && !currentMessageBookingSignal
-    ? clearStaleBookingMemory(sanitizeAgentMemoryUpdate(agentResult.memory_update, messageText))
-    : sanitizeAgentMemoryUpdate(agentResult.memory_update, messageText);
+    ? clearStaleBookingMemory(sanitizeAgentMemoryUpdate(agentResult.memory_update, messageText, payload))
+    : sanitizeAgentMemoryUpdate(agentResult.memory_update, messageText, payload);
   const safeAgentResult = {
     ...agentResult,
     memory_update: safeMemoryUpdate
@@ -502,11 +1080,32 @@ export async function processIncomingMessage(input) {
   Object.assign(safeAgentResult, preValidationSafetyOverride.agentResult);
   pipelineEvents.push(...preValidationSafetyOverride.events);
 
-  const nextMemory = normalizeBookingMemory(mergeMemory(
+  const correctionSafetyOverride = applyActionableCorrectionSafetyOverride({
+    agentResult: safeAgentResult,
+    messageText,
+    memory: baseMemory,
+    activeAppointment
+  });
+  Object.assign(safeAgentResult, correctionSafetyOverride.agentResult);
+  pipelineEvents.push(...correctionSafetyOverride.events);
+
+  let nextMemory = normalizeBookingMemory(mergeMemory(
     baseMemory,
     safeAgentResult.memory_update,
     deterministicFacts
   ));
+  const ambiguousTimeClarification = getAmbiguousAppointmentTimeClarification(messageText);
+  if (ambiguousTimeClarification && nextMemory.preferred_time === "05:00") {
+    nextMemory = { ...nextMemory };
+    delete nextMemory.preferred_time;
+    pipelineEvents.push({
+      type: "ambiguous_time_cleared",
+      source_text: messageText.slice(0, 160),
+      previous_time: "05:00",
+      suggested_time: ambiguousTimeClarification.suggested_time,
+      reason: "low_hour_without_day_part"
+    });
+  }
   const hasBookingDraft = isDraftAppointmentStatus(activeAppointment?.status);
   const hasConfirmedBooking = activeAppointment?.status === "confirmed";
   const bookingIntent = currentMessageBookingSignal || (
@@ -517,6 +1116,12 @@ export async function processIncomingMessage(input) {
       deterministicFacts
     })
   );
+  nextMemory = enrichMemoryWithBookingState(nextMemory, {
+    previousMemory: baseMemory,
+    payload,
+    bookingIntent,
+    activeAppointment
+  });
   const conversationState = resolveConversationState({
     memory: baseMemory,
     activeAppointment,
@@ -526,7 +1131,10 @@ export async function processIncomingMessage(input) {
   const postBookingSocialReply = hasConfirmedBooking
     ? buildPostBookingSocialReply({ messageText, appointmentRequest: activeAppointment, memory: nextMemory })
     : null;
-  const missingBookingFields = getMissingAppointmentFields({ memory: nextMemory, payload });
+  const missingBookingFields = normalizeBookingMissingFieldsForState(
+    getMissingAppointmentFields({ memory: nextMemory, payload }),
+    { memory: nextMemory, payload, bookingIntent }
+  );
   const workingHoursValidation = validateRequestedTimeAgainstWorkingHours({
     date: nextMemory.preferred_date,
     time: nextMemory.preferred_time,
@@ -543,7 +1151,13 @@ export async function processIncomingMessage(input) {
     conversationState,
     workingHoursValidation
   });
-  const responseMissingBookingFields = bookingIntent ? appointmentValidation.missing_fields : [];
+  const responseMissingBookingFields = bookingIntent
+    ? filterMissingBookingFieldsForReply(appointmentValidation.missing_fields, { memory: nextMemory, payload, recentMessages })
+    : [];
+  const replyAppointmentValidation = {
+    ...appointmentValidation,
+    missing_fields: responseMissingBookingFields
+  };
   const shouldCreateAppointmentRequest = appointmentValidation.allowed;
   let appointmentRequest = null;
   let slotConflict = null;
@@ -609,6 +1223,17 @@ export async function processIncomingMessage(input) {
     informationQuestion: isInformationQuestion(messageText),
     agentResult: safeAgentResult
   });
+  nextMemory = enrichMemoryWithBookingState(nextMemory, {
+    previousMemory: baseMemory,
+    payload,
+    bookingIntent,
+    appointmentValidation,
+    appointmentRequest,
+    activeAppointment,
+    slotConflict,
+    agentResult: safeAgentResult,
+    missingFields: appointmentValidation.missing_fields
+  });
 
   let finalReply = safeAgentResult.reply;
   let replySource = "agent";
@@ -624,24 +1249,35 @@ export async function processIncomingMessage(input) {
   } else if (conversationIntent.intent === "pricing_question") {
     finalReply = buildDentalServiceInfoReply({ service: conversationIntent.service, serviceCategory: conversationIntent.service_category, messageText });
     replySource = "dental_service_info";
+  } else if (conversationIntent.intent === "service_question") {
+    finalReply = buildDentalServiceInfoReply({ service: conversationIntent.service, serviceCategory: conversationIntent.service_category, messageText });
+    replySource = "dental_service_info";
   } else if (slotConflict) {
     finalReply = buildSlotConflictReply({ memory: nextMemory, slotConflict, messageText });
     replySource = "slot_conflict";
   } else if (appointmentRequest && shouldCreateAppointmentRequest) {
     finalReply = buildBookingConfirmedReply({ appointmentRequest, memory: nextMemory, messageText });
     replySource = "booking_confirmed";
+  } else if (actionableBookingCorrection && bookingIntent && !appointmentValidation.allowed) {
+    finalReply = buildActionableBookingCorrectionReply({
+      memory: nextMemory,
+      payload,
+      missingFields: responseMissingBookingFields,
+      messageText
+    });
+    replySource = "booking_correction_progress";
   } else if (conversationIntent.intent === "booking_request" && bookingIntent && !appointmentValidation.allowed) {
-    finalReply = buildBookingProgressReply({ memory: nextMemory, payload, missingFields: appointmentValidation.missing_fields, messageText });
+    finalReply = buildBookingProgressReply({ memory: nextMemory, payload, missingFields: responseMissingBookingFields, messageText, recentMessages });
     replySource = "booking_progress";
   } else if (conversationIntent.intent === "booking_request" && isUnsafeDentalServiceReply(safeAgentResult.reply)) {
-    finalReply = buildBookingProgressReply({ memory: nextMemory, payload, missingFields: appointmentValidation.missing_fields, messageText });
+    finalReply = buildBookingProgressReply({ memory: nextMemory, payload, missingFields: responseMissingBookingFields, messageText, recentMessages });
     replySource = "booking_progress";
   } else if (bookingIntent && shouldUseWorkflowProgressReply({
     agentReply: safeAgentResult.reply,
-    missingFields: appointmentValidation.missing_fields,
+    missingFields: responseMissingBookingFields,
     messageText
   })) {
-    finalReply = buildBookingProgressReply({ memory: nextMemory, payload, missingFields: appointmentValidation.missing_fields, messageText });
+    finalReply = buildBookingProgressReply({ memory: nextMemory, payload, missingFields: responseMissingBookingFields, messageText, recentMessages });
     replySource = "booking_progress";
   } else if (!String(finalReply || "").trim()) {
     finalReply = buildClassifierGuidedReply({
@@ -649,7 +1285,7 @@ export async function processIncomingMessage(input) {
       memory: nextMemory,
       payload,
       messageText,
-      appointmentValidation,
+      appointmentValidation: replyAppointmentValidation,
       bookingIntent
     });
     replySource = "reply_builder";
@@ -662,6 +1298,7 @@ export async function processIncomingMessage(input) {
     bookingIntent
   });
   finalReply = softenInformationQuestionReply(finalReply, { messageText, bookingIntent });
+  finalReply = stripUnsafeDoctorAddressing(finalReply, { memory: nextMemory, payload });
   if (shouldHumanizeReplySource(replySource)) {
     const humanized = await humanizeReplyWithAI({
       safeReply: finalReply,
@@ -671,9 +1308,15 @@ export async function processIncomingMessage(input) {
     });
     pipelineEvents.push(...humanized.events);
     finalReply = humanized.reply || finalReply;
+    finalReply = stripUnsafeDoctorAddressing(finalReply, { memory: nextMemory, payload });
   }
   finalReply = sanitizeReplyForUser(finalReply, { userMessage: messageText });
+  finalReply = stripUnsafeDoctorAddressing(finalReply, { memory: nextMemory, payload });
   finalReply = avoidRepeatedBotReply(finalReply, recentMessages);
+  nextMemory = recordBookingStateTurn(nextMemory, {
+    reply: finalReply,
+    missingFields: responseMissingBookingFields
+  });
 
   const recentOutgoingMessage = await prisma.message.findFirst({
     where: {
@@ -1076,6 +1719,12 @@ async function clearPendingBooking({ conversationId, contactId, activeAppointmen
       }
     });
 
+    await prisma.appointmentSlot.deleteMany({
+      where: {
+        appointmentRequestId: { in: appointmentIds }
+      }
+    });
+
     await prisma.appointmentReminder.updateMany({
       where: {
         appointmentRequestId: { in: appointmentIds },
@@ -1111,6 +1760,18 @@ async function upsertAppointmentRequest({ conversationId, contactId, payload, me
       : "collecting";
 
   try {
+    if (confirm && preferredDate && preferredTime) {
+      await prisma.appointmentSlot.deleteMany({
+        where: {
+          slotDate: preferredDate,
+          slotTime: preferredTime,
+          appointmentRequest: {
+            status: { notIn: ["new", "pending", "collecting", "waiting_confirmation", "confirmed"] }
+          }
+        }
+      });
+    }
+
     const appointmentRequest = await prisma.$transaction(async (tx) => {
       const existingCandidates = await tx.appointmentRequest.findMany({
         where: {
@@ -1122,16 +1783,17 @@ async function upsertAppointmentRequest({ conversationId, contactId, payload, me
         take: 10
       });
       const reusableExisting = existingCandidates.find(isAppointmentStillRelevant) || null;
+      const appointmentPhone = normalizeAppointmentPhone(memory.phone) || normalizeAppointmentPhone(payload.phone);
 
       const data = {
-        patientName: memory.patient_name || payload.display_name || null,
-        phone: memory.phone || payload.phone || null,
+        patientName: truncateDbString(getSafePatientName(memory, payload), 255),
+        phone: appointmentPhone,
         complaint: memory.complaint || null,
-        requestedService: memory.requested_service || null,
+        requestedService: truncateDbString(memory.requested_service, 255),
         preferredDate,
         preferredTime,
-        preferredDoctor: memory.preferred_doctor || null,
-        urgency: memory.urgency || "normal",
+        preferredDoctor: truncateDbString(memory.preferred_doctor, 255),
+        urgency: truncateDbString(memory.urgency, 50) || "normal",
         consentToBook: Boolean(memory.consent_to_book),
         status,
         updatedAt: new Date()
@@ -1231,6 +1893,8 @@ function clearStaleBookingMemory(memory = {}) {
   delete cleaned.consent_to_book;
   delete cleaned.preferred_doctor;
   delete cleaned.requested_service;
+  delete cleaned.time_constraint;
+  delete cleaned.booking_state;
   delete cleaned.urgency;
   delete cleaned.complaint;
 
@@ -1277,9 +1941,11 @@ function hasActionableBookingFacts(facts = {}) {
     facts.complaint ||
     facts.preferred_date ||
     facts.preferred_time ||
+    facts.time_constraint ||
     facts.requested_service ||
     facts.preferred_doctor ||
-    facts.consent_to_book === true
+    facts.consent_to_book === true ||
+    facts.confirmation === true
   );
 }
 
@@ -1290,8 +1956,10 @@ function hasSchedulingBookingFacts(facts = {}) {
     facts.phone ||
     facts.preferred_date ||
     facts.preferred_time ||
+    facts.time_constraint ||
     facts.preferred_doctor ||
-    facts.consent_to_book === true
+    facts.consent_to_book === true ||
+    facts.confirmation === true
   );
 }
 
@@ -1338,23 +2006,34 @@ export function detectConversationIntent(text = "") {
 
   if (dentalService.detected) {
     const pricing = isInformationQuestion(lower);
+    const medicalRisk = detectMedicalRisk(lower);
+    const serviceQuestion = isDentalServiceQuestionContext(lower, dentalService);
+    const intent = medicalRisk
+      ? "medical_question"
+      : (pricing ? "pricing_question" : (serviceQuestion ? "service_question" : "booking_request"));
+    const answeringQuestion = intent === "pricing_question" || intent === "service_question";
     return {
-      intent: pricing ? "pricing_question" : "booking_request",
-      sub_intent: dentalService.sub_intent,
-      action: pricing ? "provide_info" : "collect_datetime",
-      state: pricing ? "answering_question" : "collecting_booking_data",
-      shouldHandoff: false,
+      intent,
+      sub_intent: pricing && dentalService.complaint ? "medical_context_price" : dentalService.sub_intent,
+      secondary_intents: pricing && dentalService.complaint
+        ? ["medical_question", "service_question"]
+        : (serviceQuestion && dentalService.complaint ? ["medical_question"] : []),
+      action: medicalRisk ? "handoff_to_admin" : (answeringQuestion ? "provide_info" : "collect_datetime"),
+      state: medicalRisk ? "handoff_required" : (answeringQuestion ? "answering_question" : "collecting_booking_data"),
+      shouldHandoff: medicalRisk,
       angry: false,
       confidence: dentalService.confidence,
       service: dentalService.service,
       service_category: dentalService.service_category,
+      complaint: dentalService.complaint || null,
       extracted: {
         service: dentalService.service,
         service_category: dentalService.service_category,
+        complaint: dentalService.complaint || null,
         relative_date: lower.includes("послезавтра") ? "day_after_tomorrow" : (lower.includes("завтра") ? "tomorrow" : null),
         appointment_reference: "none"
       },
-      safe_next_action: pricing ? "provide_info" : (normalizeAppointmentTime(lower) ? "collect_date" : "collect_time"),
+      safe_next_action: medicalRisk ? "handoff_to_admin" : (answeringQuestion ? "provide_info" : (normalizeAppointmentTime(lower) ? "collect_date" : "collect_time")),
       reason: dentalService.reason,
       events: [
         { type: "dental_service_detected", service: dentalService.service, service_category: dentalService.service_category },
@@ -1478,7 +2157,17 @@ export function classifyConversationRisk({ userMessage = "", agentOutput = {}, c
     });
   }
 
-  if (detectAggressionWithComplaint(text)) {
+  if (detectHumanEscalationRequest(text)) {
+    return setRisk({
+      level: "high",
+      type: "human_requested",
+      shouldHandoff: true,
+      reason: "human_requested",
+      event: { type: "human_escalation_requested" }
+    });
+  }
+
+  if (detectAggressionWithComplaint(text, context)) {
     return setRisk({
       level: "high",
       type: "aggression",
@@ -1566,14 +2255,130 @@ function detectLegalThreat(text = "") {
   return /(суд|юрист|адвокат|прокуратур|роспотреб|минздрав|иск|заявлени[ея]\s+на\s+вас|буду\s+жаловаться)/iu.test(text);
 }
 
+function detectHumanEscalationRequest(text = "") {
+  return /(администратор|админа|оператор|человек|живой\s+сотрудник|позовите\s+руковод|руководств)/iu.test(text);
+}
+
 function detectWrongBookingComplaint(text = "") {
   return /(зачем\s+вы\s+меня\s+записал|я\s+не\s+просил|я\s+не\s+просила|без\s+моего\s+подтверждения|мы\s+еще\s+ничего\s+не\s+обговорили|мы\s+ещё\s+ничего\s+не\s+обговорили|я\s+не\s+подтверждал|я\s+не\s+подтверждала)/iu.test(text);
 }
 
-function detectAggressionWithComplaint(text = "") {
-  const aggressive = /(ебан|ебл|нах|хуй|пизд|бля|сука|охуел|охуели|урод|долбо|туп)/iu.test(text);
+function detectAggressionWithComplaint(text = "", context = {}) {
+  if (isActionableBookingCorrection(text, context) && detectMildAggression(text) && !detectHighAggression(text) && !detectHumanEscalationRequest(text)) {
+    return false;
+  }
+
+  const aggressive = detectMildAggression(text) || detectHighAggression(text);
   const complaint = /(запис|цена|дорог|почему|что\s+за|вы\s+что|вы\s+чо|не\s+просил|не\s+надо|отмен|удалите\s+запись)/iu.test(text);
   return aggressive && complaint;
+}
+
+function detectMildAggression(text = "") {
+  return /(тупите|тупишь|вы\s+ч[еёо]|бля|блин|ебать|ёбать)/iu.test(text);
+}
+
+function detectHighAggression(text = "") {
+  return /(нахуй|пошли\s+нах|долбо[её]б|уеб|уёб|сука.*клиник|мраз|урод|ебан|еблан|пизд)/iu.test(text);
+}
+
+export function isActionableBookingCorrection(text = "", context = {}) {
+  const lower = String(text || "").toLowerCase();
+  const memory = context.memory || {};
+  const hasCorrection = /(имею\s+в\s*виду|имел[а]?\s+в\s*виду|я\s+имел|я\s+имела|17\s*:?\s*00|17\s+00|5\s+дня|пять\s+дня|в\s+5\s+(?:дня|вечера)|не\s+05|не\s+утра)/iu.test(lower);
+  if (!hasCorrection) return false;
+
+  const hasBookingContextInText = /(запис|время|завтра|сегодня|послезавтра|врач|дмитр|при[её]м|чистк|гигиен|слот|принять|примет)/iu.test(lower);
+  const hasBookingContextInMemory = Boolean(
+    memory.intent === "book_appointment" ||
+    memory.requested_service ||
+    memory.complaint ||
+    memory.preferred_date ||
+    memory.preferred_doctor ||
+    memory.status === "collecting_booking_data" ||
+    memory.status === "handoff_required" ||
+    context.activeAppointment
+  );
+
+  return hasBookingContextInText || hasBookingContextInMemory;
+}
+
+function canResumeAiAfterActionableCorrection(text = "", context = {}) {
+  if (!isActionableBookingCorrection(text, context)) return false;
+  if (detectLegalThreat(text) || detectBadReviewThreat(text) || detectReputationRisk(text) || detectHumanEscalationRequest(text)) return false;
+  if (detectHighAggression(text)) return false;
+  return true;
+}
+
+export function canResumeAiFromHumanTakeover(text = "", context = {}) {
+  if (canResumeAiAfterActionableCorrection(text, context)) return true;
+
+  const latestHandoff = context.latestHandoff || {};
+  if (!["aggression_with_complaint", "angry_abuse", "cancel_or_wrong_booking_complaint"].includes(latestHandoff.reason)) {
+    return false;
+  }
+
+  if (detectLegalThreat(text) || detectBadReviewThreat(text) || detectReputationRisk(text) || detectHumanEscalationRequest(text) || detectHighAggression(text)) {
+    return false;
+  }
+
+  return isSafeBusinessResumeMessage(text);
+}
+
+function isSafeBusinessResumeMessage(text = "") {
+  const lower = String(text || "").toLowerCase();
+  if (isGreetingOnly(text)) return true;
+  if (hasExplicitBookingRequest(text)) return true;
+  if (isBookingIntent({ text, memory: extractBookingFacts(text) })) return true;
+  if (detectDentalServiceIntent(lower).detected) return true;
+  return /(запис|при[её]м|чистк|гигиен|кариес|лечени|консультац|завтра|сегодня|послезавтра|врач|стоматолог|болит|стоимост|цена|сколько|скок)/iu.test(lower);
+}
+
+function getResumeMemoryStatus(text = "") {
+  return isGreetingOnly(text) ? "idle" : "collecting_booking_data";
+}
+
+function applyActionableCorrectionSafetyOverride({ agentResult = {}, messageText = "", memory = {}, activeAppointment = null } = {}) {
+  const safeAgentResult = {
+    ...agentResult,
+    memory_update: { ...(agentResult.memory_update || {}) },
+    memory_patch: { ...(agentResult.memory_patch || {}) }
+  };
+  const events = [];
+
+  if (!canResumeAiAfterActionableCorrection(messageText, { memory, activeAppointment })) {
+    return { agentResult: safeAgentResult, events };
+  }
+
+  const asksForHandoff = Boolean(safeAgentResult.should_handoff) ||
+    safeAgentResult.action === "handoff_to_admin" ||
+    safeAgentResult.safe_next_action === "handoff_to_admin" ||
+    safeAgentResult.memory_update.status === "handoff_required" ||
+    safeAgentResult.memory_patch.status === "handoff_required";
+
+  if (!asksForHandoff) {
+    return { agentResult: safeAgentResult, events };
+  }
+
+  events.push({
+    type: "handoff_suppressed_for_actionable_booking_correction",
+    previous_action: safeAgentResult.action || null,
+    previous_reason: safeAgentResult.handoff_reason || null
+  });
+
+  safeAgentResult.intent = "booking";
+  safeAgentResult.action = "collect_datetime";
+  safeAgentResult.safe_next_action = "collect_datetime";
+  safeAgentResult.should_handoff = false;
+  safeAgentResult.handoff_reason = null;
+  safeAgentResult.should_create_appointment_request = false;
+  safeAgentResult.memory_update.status = "collecting_booking_data";
+  safeAgentResult.memory_patch.status = "collecting_booking_data";
+
+  if (/администратор|передам|остановлю|handoff/iu.test(String(safeAgentResult.reply || ""))) {
+    safeAgentResult.reply = "";
+  }
+
+  return { agentResult: safeAgentResult, events };
 }
 
 function detectMedicalRisk(text = "") {
@@ -1586,15 +2391,30 @@ function countRecentPriceObjections(messages = []) {
 
 export function detectDentalServiceIntent(text = "") {
   const lower = String(text || "").toLowerCase();
-  const wisdom = /(удал(?:ить|ите|ение|ен[а-я]*)|вырвать|вырывать).{0,40}(зуб(?:а|ы)?\s+мудрости|мудрости|восьм[её]рк[ауи]?)|(зуб(?:а|ы)?\s+мудрости|восьм[её]рк[ауи]?).{0,40}(удал(?:ить|ите|ение|ен[а-я]*)|вырвать|вырывать)/iu.test(lower);
-  if (wisdom) {
+  const wisdomTerm = /(зуб(?:а|ы)?\s+мудрости|восьм[её]рк[а-я]*)/iu.test(lower);
+  const wisdomComplaint = detectWisdomToothComplaint(lower);
+  const wisdomExtraction = /(удал(?:ить|ите|ение|ен[а-я]*)|вырвать|вырывать).{0,40}(зуб(?:а|ы)?\s+мудрости|мудрости|восьм[её]рк[а-я]*)|(зуб(?:а|ы)?\s+мудрости|восьм[её]рк[а-я]*).{0,40}(удал(?:ить|ите|ение|ен[а-я]*)|вырвать|вырывать)/iu.test(lower);
+  if (wisdomExtraction) {
     return {
       detected: true,
       confidence: 0.98,
       service: "удаление зуба мудрости",
       service_category: "wisdom_tooth_extraction",
+      complaint: wisdomComplaint,
       sub_intent: "dental_service_request",
       reason: "delete_word_near_wisdom_tooth"
+    };
+  }
+
+  if (wisdomTerm) {
+    return {
+      detected: true,
+      confidence: wisdomComplaint ? 0.86 : 0.78,
+      service: "зубы мудрости",
+      service_category: "wisdom_tooth_extraction",
+      complaint: wisdomComplaint,
+      sub_intent: wisdomComplaint ? "dental_complaint" : "dental_service_context",
+      reason: wisdomComplaint ? "wisdom_tooth_eruption_context" : "wisdom_tooth_context"
     };
   }
 
@@ -1611,6 +2431,24 @@ export function detectDentalServiceIntent(text = "") {
   }
 
   return { detected: false, confidence: 0, service: null, service_category: null, sub_intent: null, reason: null };
+}
+
+function detectWisdomToothComplaint(text = "") {
+  const lower = String(text || "").toLowerCase();
+  if (!/(зуб(?:а|ы)?\s+мудрости|восьм[её]рк[а-я]*)/iu.test(lower)) return null;
+  if (/(реж(?:е|у)тся|режется|лез(?:е|у)т|лезет|прорез(?:ыва)?[а-я]*)/iu.test(lower)) {
+    return "режутся зубы мудрости";
+  }
+  if (/(болит|ноет|беспоко[иь]т|тянет)/iu.test(lower)) {
+    return "беспокоят зубы мудрости";
+  }
+  return null;
+}
+
+function isDentalServiceQuestionContext(text = "", dentalService = {}) {
+  const lower = String(text || "").toLowerCase();
+  return dentalService.sub_intent === "dental_complaint" ||
+    /((чо|че|чё|что)\s+делать|как\s+быть|болит|ноет|реж(?:е|у)тся|режется|лез(?:е|у)т|лезет)/iu.test(lower);
 }
 
 export function detectExplicitAppointmentCancel(text = "") {
@@ -1684,6 +2522,10 @@ export function resolveConversationState({
   informationQuestion = false
 } = {}) {
   if (CONVERSATION_STATES.has(memory.status)) return memory.status;
+  if (memory.booking_state?.status === "awaiting_confirmation" || memory.booking_state?.status === "suggesting_slot") return "waiting_booking_confirmation";
+  if (memory.booking_state?.status === "collecting_info") return "collecting_booking_data";
+  if (memory.booking_state?.status === "confirmed") return "appointment_booked";
+  if (memory.booking_state?.status === "handoff_required") return "handoff_required";
   if (activeAppointment?.status === "confirmed") return "appointment_booked";
   if (activeAppointment?.status === "waiting_confirmation") return "waiting_booking_confirmation";
   if (isDraftAppointmentStatus(activeAppointment?.status)) return "collecting_booking_data";
@@ -1726,8 +2568,7 @@ export function buildSafeScriptedReply({
   afterReminder = false,
   shouldHandoff = false
 } = {}) {
-  const name = shortName(memory.patient_name || payload.display_name || "");
-  const prefix = name ? `${name}, ` : "";
+  const prefix = getSafePatientPrefix(memory, payload);
 
   if (intent === "cancel") {
     if (shouldHandoff) {
@@ -1789,6 +2630,9 @@ export function buildSafeScriptedReply({
     return pickNoiseReply(messageText);
   }
 
+  const topicReply = buildUnderstoodDentalTopicReply({ messageText, memory });
+  if (topicReply) return topicReply;
+
   return "Подскажите, пожалуйста, что хотите уточнить по услугам, стоимости или записи.";
 }
 
@@ -1805,7 +2649,13 @@ function pickNoiseReply(messageText = "") {
 
 function buildDentalServiceInfoReply({ service = "", serviceCategory = "", messageText = "" } = {}) {
   if (serviceCategory === "wisdom_tooth_extraction") {
-    return "Удаление зуба мудрости зависит от сложности и положения зуба. Могу сориентировать по диапазону или передать администратору для точной стоимости.";
+    const warning = hasWisdomToothComplaint(messageText)
+      ? " Если есть сильная боль, отек или температура, лучше обратиться быстрее."
+      : "";
+    if (!isInformationQuestion(messageText) && /((чо|че|чё|что)\s+делать|как\s+быть)/iu.test(String(messageText || ""))) {
+      return `Если режутся зубы мудрости, лучше записаться на осмотр к стоматологу-хирургу: врач посмотрит положение зуба и скажет, нужно ли удаление.${warning}`;
+    }
+    return `Стоимость удаления зуба мудрости зависит от сложности. Точную цену врач скажет после осмотра, могу передать вопрос администратору.${warning}`;
   }
 
   if (serviceCategory === "tooth_extraction") {
@@ -1813,6 +2663,30 @@ function buildDentalServiceInfoReply({ service = "", serviceCategory = "", messa
   }
 
   return `${service || "Услуга"} зависит от ситуации после осмотра. Могу подсказать по записи или передать вопрос администратору.`;
+}
+
+function buildUnderstoodDentalTopicReply({ messageText = "", memory = {}, extracted = {} } = {}) {
+  const dentalService = detectDentalServiceIntent(messageText);
+  const hasPriceSignal = isInformationQuestion(messageText);
+  const serviceCategory = extracted.service_category || dentalService.service_category || null;
+  const service = extracted.service || dentalService.service || memory.requested_service || "";
+  const complaint = extracted.complaint || dentalService.complaint || memory.complaint || "";
+
+  if (!hasPriceSignal && !serviceCategory && !service && !complaint) return null;
+
+  if (serviceCategory || service || complaint || hasPriceSignal) {
+    return buildDentalServiceInfoReply({
+      service: service || complaint,
+      serviceCategory,
+      messageText
+    });
+  }
+
+  return null;
+}
+
+function hasWisdomToothComplaint(messageText = "") {
+  return Boolean(detectWisdomToothComplaint(messageText));
 }
 
 function buildPriceObjectionReply({ messageText = "", memory = {}, rounds = 1 } = {}) {
@@ -1992,6 +2866,11 @@ function buildClassifierGuidedReply({
     });
   }
 
+  if (["unknown", "noise", "message"].includes(classifierIntent)) {
+    const topicReply = buildUnderstoodDentalTopicReply({ messageText, memory, extracted });
+    if (topicReply) return topicReply;
+  }
+
   if (classifierIntent === "noise") {
     return buildSafeScriptedReply({ intent: "noise", memory, payload, messageText });
   }
@@ -2007,7 +2886,7 @@ function buildClassifierGuidedReply({
     return buildBookingProgressReply({ memory, payload, missingFields, messageText });
   }
 
-  if (classifierIntent === "pricing_question") {
+  if (classifierIntent === "pricing_question" || classifierIntent === "pricing") {
     return buildDentalServiceInfoReply({
       service: extracted.service || memory.requested_service,
       serviceCategory: extracted.service_category,
@@ -2121,9 +3000,15 @@ export function validateAppointmentCreation(output = {}, memory = {}, context = 
   const messageText = context.messageText || "";
   const missingFields = [...new Set(context.missingFields || [])];
   const explicitConfirmation = hasExplicitBookingConfirmation(messageText) || memory.consent_to_book === true;
+  const missingWithoutConfirmation = missingFields.filter((field) => field !== "consent_to_book");
+  const shouldAskConfirmation = shouldRequireBookingConfirmation({
+    memory,
+    missingFields: missingWithoutConfirmation,
+    bookingIntent: context.bookingIntent
+  });
   const effectiveMissing = explicitConfirmation
-    ? missingFields.filter((field) => field !== "consent_to_book")
-    : [...new Set([...missingFields, "consent_to_book"])];
+    ? missingWithoutConfirmation
+    : (shouldAskConfirmation ? [...new Set([...missingWithoutConfirmation, "consent_to_book"])] : missingWithoutConfirmation);
 
   if (context.cancelIntent || memory.status === "cancellation_requested" || memory.status === "handoff_required" || memory.status === "human_takeover" || context.conversationState === "cancellation_requested" || context.conversationState === "handoff_required" || context.conversationState === "human_takeover") {
     return {
@@ -2161,12 +3046,21 @@ export function validateAppointmentCreation(output = {}, memory = {}, context = 
     };
   }
 
-  if (!explicitConfirmation) {
+  if (!explicitConfirmation && shouldAskConfirmation) {
     return {
       allowed: false,
       missing_fields: effectiveMissing,
       downgraded_action: "offer_booking",
       reason: "missing_explicit_confirmation"
+    };
+  }
+
+  if (!explicitConfirmation) {
+    return {
+      allowed: false,
+      missing_fields: effectiveMissing,
+      downgraded_action: chooseDowngradedBookingAction(effectiveMissing),
+      reason: effectiveMissing.length ? "missing_required_booking_fields" : "missing_explicit_confirmation"
     };
   }
 
@@ -2190,6 +3084,7 @@ export function validateAppointmentCreation(output = {}, memory = {}, context = 
 function chooseDowngradedBookingAction(missingFields = []) {
   if (missingFields.includes("patient_name")) return "collect_name";
   if (missingFields.includes("contact")) return "collect_phone";
+  if (missingFields.includes("preferred_doctor")) return "collect_more_info";
   if (missingFields.includes("preferred_date") || missingFields.includes("preferred_time")) return "collect_datetime";
   if (missingFields.includes("reason")) return "collect_more_info";
   if (missingFields.includes("consent_to_book")) return "offer_booking";
@@ -2219,12 +3114,13 @@ function hasExplicitBookingRequest(text = "") {
 function hasExplicitBookingConfirmation(text = "") {
   const lower = String(text || "").toLowerCase();
   if (isInformationQuestion(lower)) return false;
+  if (isBookingConfirmationText(lower)) return true;
   return /(запишите\s+меня|хочу\s+записа|да,\s*запиш|^подходит[!.?\s]*$|подходит,\s*запиш|^давайте[!.?\s]*$|давайте\s+запиш|запишите\s+на|записывайте|оформите\s+запись|фиксируйте\s+запись|подтверждаю\s+запись)/iu.test(lower);
 }
 
 function isInformationQuestion(text = "") {
   const lower = String(text || "").toLowerCase();
-  return /(сколько|скок|скока|цена|стоимост|прайс|какие\s+врачи|какой\s+врач|кто\s+врач|когда\s+можно|есть\s+ли\s+врач|консультаци|при[её]м\s+сколько|можно\s+приехать)/iu.test(lower) &&
+  return /(по\s+бабк|как\s+по\s+бабк|как\s+по\s+деньг|по\s+деньгам|(?:^|\s)деньги(?:\s|$)|сколько|скок|скока|цена|стоимост|стоить|стоит|прайс|ценник|какие\s+врачи|какой\s+врач|кто\s+врач|когда\s+можно|есть\s+ли\s+врач|консультаци|при[её]м\s+сколько|можно\s+приехать)/iu.test(lower) &&
     !/(запишите|хочу\s+записа|давайте\s+запиш|подходит,\s*запиш|оформите\s+запись)/iu.test(lower);
 }
 
@@ -2242,7 +3138,86 @@ async function logPipelineEvents({ conversationId, events = [] }) {
   });
 }
 
-function sanitizeAgentMemoryUpdate(update = {}, messageText = "") {
+export function postValidateMemoryNameRoles(update = {}, {
+  messageText = "",
+  payload = {},
+  strictPatientSource = true
+} = {}) {
+  const cleaned = { ...(update || {}) };
+  const explicitPatient = extractExplicitPatientName(messageText);
+  const doctorMention = findKnownDoctorMention(messageText);
+
+  if (doctorMention && !cleaned.preferred_doctor) {
+    cleaned.preferred_doctor = doctorMention.preferredName;
+  }
+
+  if (cleaned.patient_name) {
+    cleaned.patient_name = normalizeName(cleaned.patient_name);
+  }
+
+  if (cleaned.preferred_doctor) {
+    cleaned.preferred_doctor = normalizeDoctorName(cleaned.preferred_doctor);
+  }
+
+  const patientName = cleaned.patient_name;
+  const doctorName = cleaned.preferred_doctor || doctorMention?.preferredName || "";
+  if (patientName) {
+    const source = resolvePatientNameSource(patientName, {
+      explicitPatient,
+      payload,
+      currentSource: cleaned.patient_name_source
+    });
+    const patientIsDoctor = Boolean(
+      namesReferToSameKnownPerson(patientName, doctorName) ||
+      (doctorName && normalizeNameKey(patientName) === normalizeNameKey(doctorName)) ||
+      isKnownClinicPersonName(patientName) ||
+      isNameInDoctorContext(patientName, messageText)
+    );
+
+    if (patientIsDoctor || (strictPatientSource && !source)) {
+      delete cleaned.patient_name;
+      delete cleaned.patient_name_source;
+    } else if (source) {
+      cleaned.patient_name_source = source;
+    }
+  } else {
+    delete cleaned.patient_name_source;
+  }
+
+  if (cleaned.patient_name && cleaned.preferred_doctor && normalizeNameKey(cleaned.patient_name) === normalizeNameKey(cleaned.preferred_doctor)) {
+    delete cleaned.patient_name;
+    delete cleaned.patient_name_source;
+  }
+
+  return cleaned;
+}
+
+function resolvePatientNameSource(patientName = "", { explicitPatient = null, payload = {}, currentSource = null } = {}) {
+  if (TRUSTED_PATIENT_NAME_SOURCES.has(currentSource) && currentSource !== "channel_profile") return currentSource;
+
+  if (explicitPatient?.name && normalizeNameKey(explicitPatient.name) === normalizeNameKey(patientName)) {
+    return explicitPatient.source;
+  }
+
+  const profileName = normalizeChannelProfileName(payload.display_name);
+  if (profileName && normalizeNameKey(profileName) === normalizeNameKey(patientName)) {
+    return "channel_profile";
+  }
+
+  if (currentSource === "channel_profile" && profileName && normalizeNameKey(profileName) === normalizeNameKey(patientName)) {
+    return "channel_profile";
+  }
+
+  return null;
+}
+
+function normalizeDoctorName(value = "") {
+  const person = findKnownClinicPersonByName(value);
+  if (person?.role === "doctor") return person.preferredName;
+  return normalizeName(value);
+}
+
+function sanitizeAgentMemoryUpdate(update = {}, messageText = "", payload = {}) {
   const cleaned = { ...(update || {}) };
   const lower = String(messageText || "").toLowerCase().trim();
   const socialOrNoise = /^(спасибо|благодарю|хорошо|понял|поняла|ок|окей|да|нет|ага|угу|ладно|класс|супер)[.!?\s]*$/iu.test(lower) ||
@@ -2265,7 +3240,11 @@ function sanitizeAgentMemoryUpdate(update = {}, messageText = "") {
     delete cleaned.requested_service;
   }
 
-  return cleaned;
+  if (cleaned.phone && !normalizeAppointmentPhone(cleaned.phone)) {
+    delete cleaned.phone;
+  }
+
+  return postValidateMemoryNameRoles(cleaned, { messageText, payload, strictPatientSource: true });
 }
 
 function looksLikeDentalTopic(text = "") {
@@ -2344,6 +3323,10 @@ export function shouldUseWorkflowProgressReply({ agentReply = "", missingFields 
     return true;
   }
 
+  if (missingFields.includes("preferred_doctor") && !/(врач|доктор|специалист)/iu.test(reply)) {
+    return true;
+  }
+
   return false;
 }
 
@@ -2357,7 +3340,7 @@ function sanitizeStaleBookingReply({ reply = "", messageText = "", memory = {}, 
     /(\d{1,2}:\d{2}|\d{1,2}\.\d{1,2}(?:\.20\d{2})?)/u.test(lowerReply);
   if (!mentionsOldVisit) return reply;
 
-  const name = shortName(memory.patient_name || "");
+  const name = shortName(getSafePatientName(memory));
 
   if (/^(привет|здравствуйте|добрый день|добрый вечер|дратути)[!.?\s]*$/iu.test(lowerMessage)) {
     return name ? `Привет, ${name}. Чем могу помочь?` : "Здравствуйте! Чем могу помочь?";
@@ -2389,8 +3372,7 @@ function softenInformationQuestionReply(reply = "", { messageText = "", bookingI
 function buildPostBookingSocialReply({ messageText, appointmentRequest, memory }) {
   const lower = String(messageText || "").toLowerCase();
   const casual = isCasualMessage(messageText);
-  const name = shortName(memory.patient_name || appointmentRequest.patientName || "");
-  const prefix = name ? `${name}, ` : "";
+  const prefix = getSafePatientPrefix(memory, {}, appointmentRequest.patientName);
   const date = appointmentRequest.preferredDate ? formatBookingDateForReply(appointmentRequest.preferredDate) : null;
   const time = appointmentRequest.preferredTime || null;
   const slot = date && time ? ` ${formatReplyDate(date, casual)} в ${time}` : "";
@@ -2424,68 +3406,118 @@ function buildPostBookingSocialReply({ messageText, appointmentRequest, memory }
 
 function buildSlotConflictReply({ memory, slotConflict, messageText }) {
   const casual = isCasualMessage(messageText);
-  const name = memory.patient_name ? `${shortName(memory.patient_name)}, ` : "";
+  const name = getSafePatientPrefix(memory);
   const date = formatReplyDate(formatBookingDateForReply(slotConflict.preferred_date), casual);
   return casual
     ? `${name}на ${date} в ${slotConflict.preferred_time} уже занято. Киньте другой день или время, проверю.`
     : `${name}на ${date} в ${slotConflict.preferred_time} уже есть запись. Напишите другой удобный день или время, и я проверю вариант.`;
 }
 
-function buildBookingConfirmedReply({ appointmentRequest, memory, messageText }) {
+export function buildBookingConfirmedReply({ appointmentRequest, memory, messageText }) {
   const casual = isCasualMessage(messageText);
-  const name = shortName(memory.patient_name || appointmentRequest.patientName);
+  const name = shortName(getSafePatientName(memory, {}, appointmentRequest.patientName));
   const service = memory.requested_service || appointmentRequest.requestedService;
   const date = formatBookingDateForReply(memory.preferred_date || appointmentRequest.preferredDate);
   const time = normalizeAppointmentTime(memory.preferred_time || appointmentRequest.preferredTime);
+  const doctor = memory.preferred_doctor || appointmentRequest.preferredDoctor;
+  const doctorText = doctor ? ` к ${formatDoctorForReply(doctor)}` : "";
   const prefix = name ? `${name}, ` : "";
   const visitText = formatVisitText(service);
-  const slot = `${formatReplyDate(date, casual)} в ${time}`;
+  const slot = `${formatReplyDate(date, casual)} в ${time}${doctorText}`;
 
   return casual
-    ? `${prefix}готово, записала ${visitText} ${slot}. Напоминание тоже поставила. Если что - пишите сюда.`
-    : `${prefix}готово, записала вас ${visitText} ${slot}. Напоминание перед визитом создала. Если что-то изменится, просто напишите.`;
+    ? `${prefix}готово, запись ${visitText} ${slot} подтверждена. Напоминание тоже поставила. Если что - пишите сюда.`
+    : `${prefix}отлично, запись ${visitText} на ${slot} подтверждена. Напоминание перед визитом создала. Если что-то изменится, просто напишите.`;
 }
 
-function buildBookingProgressReply({ memory, payload, missingFields, messageText }) {
+export function buildBookingProgressReply({ memory, payload, missingFields, messageText, recentMessages = [], baseDate = new Date() }) {
   const casual = isCasualMessage(messageText);
-  const name = shortName(memory.patient_name || payload.display_name);
-  const prefix = name ? `${name}, ` : "";
+  const prefix = getSafePatientPrefix(memory, payload);
   const service = formatProgressService(memory.requested_service || memory.complaint || "прием");
   const date = memory.preferred_date ? formatBookingDateForReply(memory.preferred_date) : null;
   const time = normalizeAppointmentTime(memory.preferred_time);
+  const doctor = memory.preferred_doctor;
+  const doctorText = doctor ? ` к ${formatDoctorForReply(doctor)}` : "";
+  const ambiguousTime = getAmbiguousAppointmentTimeClarification(messageText);
+  const effectiveMissingFields = filterMissingBookingFieldsForReply(missingFields, { memory, payload, recentMessages });
 
-  if (missingFields.includes("patient_name")) {
+  if (effectiveMissingFields.includes("patient_name")) {
     return casual ? "Как вас зовут?" : "Подскажите, как вас зовут?";
   }
 
-  if (missingFields.includes("reason")) {
+  if (effectiveMissingFields.includes("reason")) {
     return casual
       ? `${prefix}что беспокоит или на какую услугу записать?`
       : `${prefix}подскажите, что беспокоит или на какую услугу хотите записаться?`;
   }
 
-  if (missingFields.includes("preferred_date") && missingFields.includes("preferred_time")) {
+  if (effectiveMissingFields.includes("preferred_date") && effectiveMissingFields.includes("preferred_time")) {
     return casual ? `${prefix}на какой день и время удобно?` : `${prefix}на какой день и время вам удобно записаться?`;
   }
 
-  if (missingFields.includes("preferred_date")) {
+  if (effectiveMissingFields.includes("preferred_date")) {
     return casual ? `${prefix}на какой день удобно?` : `${prefix}на какой день вам удобно записаться?`;
   }
 
-  if (missingFields.includes("preferred_time")) {
+  if (effectiveMissingFields.includes("preferred_time")) {
+    if (ambiguousTime) {
+      return casual
+        ? `${prefix}${ambiguousTime.question}`
+        : `${prefix}${ambiguousTime.question} Напишите, пожалуйста, точное время.`;
+    }
+
     return casual ? `${prefix}на какое время удобно?` : `${prefix}на какое время вам удобно записаться?`;
   }
 
-  if (missingFields.includes("consent_to_book")) {
-    const replyDate = date ? formatReplyDate(date, casual) : null;
+  if (effectiveMissingFields.includes("preferred_doctor")) {
+    return casual ? `${prefix}к какому врачу записать?` : `${prefix}подскажите, к какому врачу хотите записаться?`;
+  }
+
+  if (effectiveMissingFields.includes("consent_to_book")) {
+    const replyDate = memory.preferred_date ? formatBookingProposalDate(memory.preferred_date, casual, baseDate) : (date ? formatReplyDate(date, casual) : null);
+    if (replyDate && time) {
+      return `${prefix}Могу предложить ${replyDate} в ${time}${doctorText}. Подтверждаете?`;
+    }
     return casual
-      ? `${prefix}${service}${replyDate ? ` на ${replyDate}` : ""}${time ? ` в ${time}` : ""}. Записать вас?`
-      : `${prefix}${service}${replyDate ? ` на ${replyDate}` : ""}${time ? ` в ${time}` : ""}. Подтвердите, записать вас?`;
+      ? `${prefix}${service}${replyDate ? ` на ${replyDate}` : ""}${time ? ` в ${time}` : ""}${doctorText}. Записать вас?`
+      : `${prefix}${service}${replyDate ? ` на ${replyDate}` : ""}${time ? ` в ${time}` : ""}${doctorText}. Подтвердите, записать вас?`;
   }
 
   return casual
     ? `${prefix}напишите услугу, дату и удобное время.`
     : `${prefix}уточните детали записи: услугу, дату и удобное время.`;
+}
+
+function buildActionableBookingCorrectionReply({ memory = {}, payload = {}, missingFields = [], messageText = "" } = {}) {
+  const time = normalizeAppointmentTime(memory.preferred_time);
+  const date = memory.preferred_date ? formatBookingDateForReply(memory.preferred_date) : null;
+  const service = formatProgressService(memory.requested_service || memory.complaint || "прием");
+  const doctor = memory.preferred_doctor ? ` к ${formatDoctorForReply(memory.preferred_doctor)}` : "";
+
+  if (missingFields.includes("preferred_time")) {
+    const ambiguousTime = getAmbiguousAppointmentTimeClarification(messageText);
+    return ambiguousTime
+      ? `Извините, уточню время: ${ambiguousTime.question}`
+      : buildBookingProgressReply({ memory, payload, missingFields, messageText });
+  }
+
+  const understood = time ? `Извините, понял вас: ${time}.` : "Извините, понял вас.";
+  if (date || service || doctor) {
+    const details = [
+      service ? `на ${service}` : null,
+      doctor || null,
+      date ? `на ${formatReplyDate(date, isCasualMessage(messageText))}` : null,
+      time ? `в ${time}` : null
+    ].filter(Boolean).join(" ");
+
+    if (missingFields.includes("consent_to_book")) {
+      return `${understood} ${details}. Подтвердите, записать вас?`;
+    }
+
+    return `${understood} Сейчас проверю возможность записи ${details}.`;
+  }
+
+  return `${understood} Продолжим запись.`;
 }
 
 function shortName(value = "") {
@@ -2514,6 +3546,12 @@ function formatProgressService(service = "") {
   return normalized;
 }
 
+function formatDoctorForReply(doctor = "") {
+  const normalized = String(doctor || "").trim();
+  if (/^дмитрий\s+алексеевич$/iu.test(normalized)) return "Дмитрию Алексеевичу";
+  return normalized;
+}
+
 function isCasualMessage(text = "") {
   const lower = String(text || "").toLowerCase();
   return /(чо|че|чё|шо|ща|щас|кароч|короч|базар|вокзал|если чо|если че|если чё|спс|пасиб|ага|норм|го|лол|кек|пж|плиз|нах|хуй|пизд|еба|ёба|бля)/iu.test(lower);
@@ -2524,6 +3562,20 @@ function formatReplyDate(dateText, casual = false) {
   if (!casual) return text;
 
   return text.replace(/\.20\d{2}$/u, "");
+}
+
+function formatBookingProposalDate(value, casual = false, baseDate = new Date()) {
+  const date = normalizeAppointmentDate(value);
+  if (!date) return formatReplyDate(formatBookingDateForReply(value), casual);
+
+  const targetIso = toBookingIsoDate(date);
+  const now = baseDate instanceof Date ? baseDate : new Date(baseDate);
+  const todayIso = toBookingIsoDate(new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate())));
+  const tomorrowIso = toBookingIsoDate(new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate() + 1)));
+
+  if (targetIso === todayIso) return "сегодня";
+  if (targetIso === tomorrowIso) return "завтра";
+  return formatReplyDate(formatBookingDateForReply(value), casual);
 }
 
 function createReminderRows(tx, { appointmentRequestId, contactId, preferredDate, preferredTime }) {

@@ -2,11 +2,18 @@ import assert from "node:assert/strict";
 import {
   avoidRepeatedBotReply,
   buildSafeScriptedReply,
+  canResumeAiFromHumanTakeover,
   classifyConversationRisk,
   detectComplaintOrAbuse,
   detectConversationIntent,
   detectNoiseMessage,
+  isActionableBookingCorrection,
   isConversationInHumanTakeover,
+  buildBookingConfirmedReply,
+  buildBookingProgressReply,
+  mergeMemory,
+  mergeBookingState,
+  postValidateMemoryNameRoles,
   validateRequestedTimeAgainstWorkingHours,
   validateAppointmentCreation
 } from "../agent-api/src/messageService.js";
@@ -16,7 +23,7 @@ import {
   shouldSendReminderForAppointment
 } from "../agent-api/src/reminderService.js";
 import { isHumanizedReplyAllowed } from "../agent-api/src/agent.js";
-import { sanitizeReplyForUser } from "../agent-api/src/replySanitizer.js";
+import { normalizeStructuredAgentOutput, sanitizeReplyForUser } from "../agent-api/src/replySanitizer.js";
 
 const cancel = detectConversationIntent("не надо переносить, денег нет просто удалите");
 assert.equal(cancel.intent, "cancel", "cancel must win over reschedule");
@@ -138,8 +145,35 @@ const legalThreat = classifyConversationRisk({ userMessage: "я пойду в с
 assert.equal(legalThreat.risk_type, "legal_threat");
 assert.equal(legalThreat.should_handoff, true);
 
+const humanRequest = classifyConversationRisk({ userMessage: "позовите администратора, хочу с человеком" });
+assert.equal(humanRequest.should_handoff, true, "explicit human/admin request must handoff");
+
 const angryComplaint = classifyConversationRisk({ userMessage: "вы что ебанулись почему записали меня" });
 assert.equal(angryComplaint.should_handoff, true);
+
+const actionableCorrection = "5 дня я имею ввиду 17 00 вы чо тупите то ебать";
+assert.equal(isActionableBookingCorrection(actionableCorrection, {
+  memory: { requested_service: "профессиональная гигиена", preferred_date: "2026-06-05", preferred_doctor: "Дмитрий Алексеевич" }
+}), true);
+const mildCorrectionRisk = classifyConversationRisk({
+  userMessage: actionableCorrection,
+  context: {
+    memory: { requested_service: "профессиональная гигиена", preferred_date: "2026-06-05", preferred_doctor: "Дмитрий Алексеевич" }
+  }
+});
+assert.equal(mildCorrectionRisk.should_handoff, false, "mild aggression with useful booking correction must not handoff");
+assert.equal(canResumeAiFromHumanTakeover("Хочу завтра на чистку", {
+  memory: { status: "handoff_required", patient_name: "Ярослав" },
+  latestHandoff: { reason: "aggression_with_complaint" }
+}), true, "safe fresh booking request must resume AI after auto handoff");
+assert.equal(canResumeAiFromHumanTakeover("позовите администратора", {
+  memory: { status: "handoff_required" },
+  latestHandoff: { reason: "aggression_with_complaint" }
+}), false, "explicit admin request must stay in handoff");
+assert.equal(canResumeAiFromHumanTakeover("Хочу завтра на чистку", {
+  memory: { status: "handoff_required" },
+  latestHandoff: { reason: "legal_threat" }
+}), false, "legal handoff must not auto-resume");
 
 const fiveAm = validateRequestedTimeAgainstWorkingHours({
   date: "2026-05-25",
@@ -173,6 +207,173 @@ const blockedByHours = validateAppointmentCreation(
 );
 assert.equal(blockedByHours.allowed, false);
 assert.equal(blockedByHours.reason, "outside_working_hours");
+
+const bookingScenarioMemory = {
+  requested_service: "лечение зубов",
+  preferred_doctor: "Дмитрий Алексеевич",
+  preferred_date: "2026-06-06",
+  preferred_time: "17:00",
+  booking_state: {
+    intent: "book_appointment",
+    service: "лечение зубов",
+    doctor: "Дмитрий Алексеевич",
+    date: "2026-06-06",
+    time: "17:00",
+    time_constraint: "after_17:00",
+    status: "awaiting_confirmation",
+    missing_fields: ["confirmation"],
+    asked_fields: []
+  }
+};
+const roleBugCorrection = postValidateMemoryNameRoles({
+  patient_name: "Дмитрий Алексеевич",
+  preferred_doctor: "Дмитрий Алексеевич",
+  requested_service: "консультация стоматолога"
+}, {
+  messageText: "хочу на консультацию к Дмитрию Алексеевичу",
+  payload: { display_name: "Ярослав" }
+});
+assert.equal(roleBugCorrection.patient_name, undefined);
+assert.equal(roleBugCorrection.patient_name_source, undefined);
+assert.equal(roleBugCorrection.preferred_doctor, "Дмитрий Алексеевич");
+assert.equal(roleBugCorrection.requested_service, "консультация стоматолога");
+
+const explicitPatientAndDoctor = postValidateMemoryNameRoles({
+  patient_name: "Ярослав",
+  preferred_doctor: "Дмитрий Алексеевич"
+}, {
+  messageText: "меня зовут Ярослав, хочу к Дмитрию Алексеевичу"
+});
+assert.equal(explicitPatientAndDoctor.patient_name, "Ярослав");
+assert.equal(explicitPatientAndDoctor.patient_name_source, "explicit_user_name");
+assert.equal(explicitPatientAndDoctor.preferred_doctor, "Дмитрий Алексеевич");
+
+const doctorMentionOnly = postValidateMemoryNameRoles({
+  patient_name: "Дмитрий Алексеевич"
+}, {
+  messageText: "слышал у вас врач Дмитрий Алексеевич хороший"
+});
+assert.equal(doctorMentionOnly.patient_name, undefined);
+assert.equal(doctorMentionOnly.preferred_doctor, "Дмитрий Алексеевич");
+
+const explicitPatientNamedDmitry = postValidateMemoryNameRoles({
+  patient_name: "Дмитрий"
+}, {
+  messageText: "запишите на имя Дмитрий"
+});
+assert.equal(explicitPatientNamedDmitry.patient_name, "Дмитрий");
+assert.equal(explicitPatientNamedDmitry.patient_name_source, "explicit_user_name");
+assert.equal(explicitPatientNamedDmitry.preferred_doctor, undefined);
+
+const doctorPrefixedReply = buildBookingProgressReply({
+  memory: {
+    requested_service: "консультация стоматолога",
+    preferred_doctor: "Дмитрий Алексеевич",
+    patient_name: "Дмитрий Алексеевич"
+  },
+  payload: {},
+  missingFields: ["preferred_date", "preferred_time"],
+  messageText: "хочу на консультацию к Дмитрию Алексеевичу"
+});
+assert.doesNotMatch(doctorPrefixedReply, /^Дмитрий,/u);
+
+const slotOffer = buildBookingProgressReply({
+  memory: bookingScenarioMemory,
+  payload: { display_name: "Ярослав", max_user_id: "max_chat_445055049" },
+  missingFields: ["consent_to_book"],
+  messageText: "хочу начать лечить зубы, к Дмитрию Алексеевичу, завтра после пяти",
+  baseDate: new Date("2026-06-05T10:00:00+05:00")
+});
+assert.match(slotOffer, /Могу предложить завтра в 17:00 к Дмитрию Алексеевичу\. Подтверждаете\?/u);
+assert.doesNotMatch(slotOffer, /Что беспокоит|На какое время удобно|К какому врачу/iu);
+
+const confirmedAfterYes = validateAppointmentCreation(
+  { action: "create_appointment" },
+  { ...bookingScenarioMemory, consent_to_book: true, patient_name: "Ярослав" },
+  {
+    bookingIntent: true,
+    messageText: "подтверждаю да",
+    missingFields: [],
+    conversationState: "waiting_booking_confirmation"
+  }
+);
+assert.equal(confirmedAfterYes.allowed, true, "awaiting confirmation + yes must create/confirm booking");
+
+const confirmationReply = buildBookingConfirmedReply({
+  appointmentRequest: {
+    patientName: "Ярослав",
+    requestedService: "лечение зубов",
+    preferredDate: "2026-06-06",
+    preferredTime: "17:00",
+    preferredDoctor: "Дмитрий Алексеевич"
+  },
+  memory: { ...bookingScenarioMemory, consent_to_book: true, patient_name: "Ярослав" },
+  messageText: "подтверждаю да"
+});
+assert.match(confirmationReply, /06\.06\.2026 в 17:00 к Дмитрию Алексеевичу/u);
+assert.match(confirmationReply, /подтверждена/u);
+assert.doesNotMatch(confirmationReply, /Что беспокоит|На какое время удобно|К какому врачу/iu);
+
+const preservedBookingState = mergeBookingState(
+  { service: "лечение зубов", doctor: "Дмитрий Алексеевич", date: "2026-06-06", time: "17:00", status: "awaiting_confirmation" },
+  { service: null, doctor: "", date: undefined, missing_fields: ["confirmation"] }
+);
+assert.equal(preservedBookingState.service, "лечение зубов");
+assert.equal(preservedBookingState.doctor, "Дмитрий Алексеевич");
+assert.equal(preservedBookingState.date, "2026-06-06");
+assert.equal(preservedBookingState.time, "17:00");
+assert.deepEqual(preservedBookingState.missing_fields, ["confirmation"]);
+
+const clearedDoctorState = mergeBookingState(
+  {
+    doctor: "Дмитрий Алексеевич",
+    date: "2026-06-06",
+    time: "17:00",
+    status: "awaiting_confirmation",
+    missing_fields: ["confirmation"]
+  },
+  { clear_fields: ["doctor"] }
+);
+assert.equal(clearedDoctorState.doctor, undefined, "explicit clear_fields must remove doctor from booking_state");
+assert.equal(clearedDoctorState.date, "2026-06-06");
+assert.equal(clearedDoctorState.status, "collecting_info");
+assert.ok(clearedDoctorState.missing_fields.includes("doctor"));
+
+const clearedDoctorMemory = mergeMemory(
+  {
+    preferred_doctor: "Дмитрий Алексеевич",
+    preferred_date: "2026-06-06",
+    preferred_time: "17:00",
+    consent_to_book: true,
+    status: "waiting_booking_confirmation",
+    booking_state: {
+      doctor: "Дмитрий Алексеевич",
+      date: "2026-06-06",
+      time: "17:00",
+      status: "awaiting_confirmation",
+      missing_fields: ["confirmation"]
+    }
+  },
+  { clear_fields: ["preferred_doctor"] }
+);
+assert.equal(clearedDoctorMemory.preferred_doctor, undefined, "explicit clear_fields must remove flat doctor");
+assert.equal(clearedDoctorMemory.booking_state.doctor, undefined, "explicit clear_fields must remove nested doctor");
+assert.equal(clearedDoctorMemory.consent_to_book, undefined, "changing core slot must invalidate old confirmation");
+assert.equal(clearedDoctorMemory.status, "collecting_booking_data");
+assert.equal(clearedDoctorMemory.booking_state.status, "collecting_info");
+assert.equal(clearedDoctorMemory.preferred_date, "2026-06-06");
+assert.equal(clearedDoctorMemory.preferred_time, "17:00");
+
+const normalizedClearPatch = normalizeStructuredAgentOutput(JSON.stringify({
+  reply: "Поняла, к Дмитрию не записываю. Подскажите, к какому врачу удобно?",
+  intent: "booking",
+  action: "collect_more_info",
+  memory_patch: {
+    clear_fields: ["preferred_doctor"],
+    status: "collecting_booking_data"
+  }
+}), "нет, не к Дмитрию, к другому врачу");
+assert.deepEqual(normalizedClearPatch.memory_update.clear_fields, ["preferred_doctor"]);
 
 assert.equal(isConversationInHumanTakeover({ status: "human_takeover" }), true);
 assert.equal(isConversationInHumanTakeover({ status: "handoff_required" }), true);

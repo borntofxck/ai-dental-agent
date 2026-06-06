@@ -207,14 +207,32 @@ export class MaxClient {
       throw new Error(`Cannot open MAX chat without numeric chat id: ${chatId}`);
     }
 
+    const currentNumericId = this.getCurrentChatIdFromUrl();
+    if (currentNumericId === numericId) {
+      console.log(`MAX chat ${numericId} is already active; skipping page.goto`);
+      return {
+        opened: false,
+        already_active: true,
+        chat_id: chatId,
+        status: await this.status()
+      };
+    }
+
+    console.log(`Opening MAX chat ${numericId}; current chat is ${currentNumericId || "unknown"}`);
     await this.page.goto(`https://web.max.ru/${numericId}`, { waitUntil: "domcontentloaded" });
-    await this.page.waitForTimeout(1000);
+    await this.page.waitForTimeout(500);
 
     return {
       opened: true,
+      already_active: false,
       chat_id: chatId,
       status: await this.status()
     };
+  }
+
+  getCurrentChatIdFromUrl(url = null) {
+    const currentUrl = String(url || this.page?.url?.() || "");
+    return currentUrl.match(/(?:^|\/)(\d+)(?:[/?#].*)?$/u)?.[1] || null;
   }
 
   async readActiveChatMessages(limit = 20) {

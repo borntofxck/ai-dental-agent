@@ -105,6 +105,7 @@ export function normalizeStructuredAgentOutput(raw, userMessage = "") {
     reply,
     intent,
     sub_intent: cleanPatchValue(parsed.sub_intent),
+    secondary_intents: normalizeSecondaryIntents(parsed.secondary_intents),
     confidence: normalizeConfidence(parsed.confidence),
     extracted: normalizeClassifierExtracted(parsed.extracted || {}),
     action,
@@ -122,6 +123,11 @@ export function normalizeStructuredAgentOutput(raw, userMessage = "") {
     memory_update: toLegacyMemoryUpdate(memoryPatch, parsed.memory_update || {}),
     should_create_appointment_request: action === "create_appointment" || Boolean(parsed.should_create_appointment_request)
   };
+}
+
+function normalizeSecondaryIntents(value = []) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map(cleanPatchValue).filter(Boolean))];
 }
 
 function normalizeConfidence(value) {
@@ -247,12 +253,16 @@ function normalizeMemoryPatch(value = {}) {
   const patch = value && typeof value === "object" ? value : {};
   return {
     name: cleanPatchValue(patch.name ?? patch.patient_name),
+    patient_name_source: normalizePatientNameSource(patch.patient_name_source),
     phone: cleanPatchValue(patch.phone),
     service: cleanPatchValue(patch.service ?? patch.requested_service),
     complaint: cleanPatchValue(patch.complaint),
     preferred_date: cleanPatchValue(patch.preferred_date),
     preferred_time: cleanPatchValue(patch.preferred_time),
-    status: cleanPatchValue(patch.status)
+    preferred_doctor: cleanPatchValue(patch.preferred_doctor ?? patch.doctor),
+    time_constraint: cleanPatchValue(patch.time_constraint),
+    status: cleanPatchValue(patch.status),
+    clear_fields: normalizePatchClearFields(patch.clear_fields ?? patch.unset_fields ?? patch.null_fields)
   };
 }
 
@@ -262,16 +272,45 @@ function cleanPatchValue(value) {
   return text ? text : null;
 }
 
+function normalizePatchClearFields(value) {
+  if (!value) return [];
+  const rawFields = Array.isArray(value) ? value : String(value).split(/[,\s]+/u);
+  const allowed = new Set([
+    "preferred_doctor",
+    "doctor",
+    "preferred_date",
+    "date",
+    "preferred_time",
+    "time",
+    "time_constraint",
+    "requested_service",
+    "service",
+    "complaint",
+    "patient_name",
+    "phone"
+  ]);
+  return [...new Set(rawFields.map((field) => String(field || "").trim()).filter((field) => allowed.has(field)))];
+}
+
+function normalizePatientNameSource(value) {
+  const source = cleanPatchValue(value);
+  return ["explicit_user_name", "channel_profile"].includes(source) ? source : null;
+}
+
 function toLegacyMemoryUpdate(memoryPatch, legacy = {}) {
   const update = { ...(legacy || {}) };
 
   if (memoryPatch.name) update.patient_name = memoryPatch.name;
+  if (memoryPatch.patient_name_source) update.patient_name_source = memoryPatch.patient_name_source;
   if (memoryPatch.phone) update.phone = memoryPatch.phone;
   if (memoryPatch.service) update.requested_service = memoryPatch.service;
   if (memoryPatch.complaint) update.complaint = memoryPatch.complaint;
   if (memoryPatch.preferred_date) update.preferred_date = memoryPatch.preferred_date;
   if (memoryPatch.preferred_time) update.preferred_time = memoryPatch.preferred_time;
+  if (memoryPatch.preferred_doctor) update.preferred_doctor = memoryPatch.preferred_doctor;
+  if (memoryPatch.time_constraint) update.time_constraint = memoryPatch.time_constraint;
   if (memoryPatch.status) update.status = memoryPatch.status;
+  if (memoryPatch.clear_fields?.length) update.clear_fields = memoryPatch.clear_fields;
 
   return Object.fromEntries(
     Object.entries(update).filter(([, value]) => value !== null && value !== undefined && value !== "")

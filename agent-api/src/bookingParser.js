@@ -1,3 +1,8 @@
+import {
+  extractExplicitPatientName,
+  findKnownDoctorMention
+} from "./nameRole.js";
+
 const MONTHS = [
   ["январь", "января"],
   ["февраль", "февраля"],
@@ -91,6 +96,17 @@ const PAIN_MARKERS = [
   "ache"
 ];
 
+const DOCTOR_ALIASES = [
+  {
+    doctor: "Дмитрий Алексеевич",
+    patterns: [
+      /(?:^|[^\p{L}\p{N}])(?:к|ко)\s+дмитрию(?:\s+алексеевичу)?(?=$|[^\p{L}\p{N}])/iu,
+      /(?:^|[^\p{L}\p{N}])дмитрию(?:\s+алексеевичу)?(?=$|[^\p{L}\p{N}])/iu,
+      /(?:^|[^\p{L}\p{N}])дмитрий\s+алексеевич(?=$|[^\p{L}\p{N}])/iu
+    ]
+  }
+];
+
 export function extractBookingFacts(messageText, baseDate = new Date()) {
   const text = String(messageText || "").trim();
   const lower = text.toLowerCase();
@@ -99,14 +115,27 @@ export function extractBookingFacts(messageText, baseDate = new Date()) {
   const phone = extractPhone(text);
   if (phone) facts.phone = phone;
 
-  const patientName = extractPatientName(text);
-  if (patientName) facts.patient_name = patientName;
+  const patientName = extractExplicitPatientName(text);
+  if (patientName) {
+    facts.patient_name = patientName.name;
+    facts.patient_name_source = patientName.source;
+  }
 
   const appointmentDate = normalizeAppointmentDate(text, baseDate);
   if (appointmentDate) facts.preferred_date = toIsoDate(appointmentDate);
 
-  const appointmentTime = normalizeAppointmentTime(text);
-  if (appointmentTime) facts.preferred_time = appointmentTime;
+  const timeConstraint = extractTimeConstraint(text);
+  if (timeConstraint.time_constraint) {
+    facts.time_constraint = timeConstraint.time_constraint;
+    facts.preferred_time = timeConstraint.preferred_time;
+  }
+
+  const appointmentTime = normalizeAppointmentTimeDetailed(text);
+  logAppointmentTimeNormalization(text, appointmentTime);
+  if (appointmentTime.time) facts.preferred_time = appointmentTime.time;
+
+  const doctor = extractPreferredDoctor(text);
+  if (doctor) facts.preferred_doctor = doctor;
 
   const service = extractService(lower);
   if (service) {
@@ -114,6 +143,14 @@ export function extractBookingFacts(messageText, baseDate = new Date()) {
     facts.complaint = service;
   } else if (PAIN_MARKERS.some((marker) => lower.includes(marker))) {
     facts.complaint = text;
+  }
+
+  const clearFields = extractBookingFieldClearSignals(text);
+  if (clearFields.length) {
+    facts.clear_fields = clearFields;
+    facts.booking_state = {
+      clear_fields: clearFields.map(mapMemoryFieldToBookingStateField).filter(Boolean)
+    };
   }
 
   if (isBookingText(lower)) {
@@ -124,7 +161,73 @@ export function extractBookingFacts(messageText, baseDate = new Date()) {
     facts.consent_to_book = true;
   }
 
+  if (isBookingConfirmationText(lower)) {
+    facts.confirmation = true;
+  }
+
   return facts;
+}
+
+export function extractPreferredDoctor(messageText = "") {
+  const text = String(messageText || "");
+  const knownDoctor = findKnownDoctorMention(text);
+  if (knownDoctor) return knownDoctor.preferredName;
+  return DOCTOR_ALIASES.find((item) => item.patterns.some((pattern) => pattern.test(text)))?.doctor || null;
+}
+
+export function extractTimeConstraint(messageText = "") {
+  const text = String(messageText || "").toLowerCase();
+  if (!text) return {};
+
+  const afterMatch = text.match(/(?:^|[^\p{L}\p{N}])после\s+(пяти|5|17)(?=$|[^\p{L}\p{N}])/iu);
+  if (afterMatch || /(?:^|[^\p{L}\p{N}])вечером(?=$|[^\p{L}\p{N}])/iu.test(text)) {
+    return {
+      time_constraint: "after_17:00",
+      preferred_time: "17:00"
+    };
+  }
+
+  return {};
+}
+
+export function isBookingConfirmationText(messageText = "") {
+  const text = String(messageText || "").trim().toLowerCase();
+  if (!text || isInformationQuestion(text)) return false;
+  return /^(?:да|ага|угу|ок|окей|подтверждаю|подтверждаю\s+да|да\s+подтверждаю|записывайте|запишите|подходит|подходит\s+да)[!.?\s]*$/iu.test(text) ||
+    /(?:^|[^\p{L}\p{N}])(?:подтверждаю|записывайте|подходит)(?:\s+да)?(?=$|[^\p{L}\p{N}])/iu.test(text);
+}
+
+export function extractBookingFieldClearSignals(messageText = "") {
+  const text = String(messageText || "").toLowerCase();
+  const fields = new Set();
+
+  if (/(?:^|[^\p{L}\p{N}])(?:не\s+(?:к|ко)\s+дмитри|не\s+дмитри|к\s+другому\s+врачу|другой\s+врач|без\s+врача|врача\s+не\s+надо)(?=$|[^\p{L}\p{N}])/iu.test(text)) {
+    fields.add("preferred_doctor");
+  }
+
+  if (/(?:^|[^\p{L}\p{N}])(?:не\s+завтра|другой\s+день|другая\s+дата)(?=$|[^\p{L}\p{N}])/iu.test(text)) {
+    fields.add("preferred_date");
+  }
+
+  if (/(?:^|[^\p{L}\p{N}])(?:другое\s+время|не\s+это\s+время|не\s+(?:в|к|ко|на|после)\s*\d{1,2})(?=$|[^\p{L}\p{N}])/iu.test(text)) {
+    fields.add("preferred_time");
+    fields.add("time_constraint");
+  }
+
+  return [...fields];
+}
+
+function mapMemoryFieldToBookingStateField(field) {
+  return {
+    preferred_doctor: "doctor",
+    preferred_date: "date",
+    preferred_time: "time",
+    time_constraint: "time_constraint",
+    requested_service: "service",
+    complaint: "complaint",
+    patient_name: "patient_name",
+    phone: "phone"
+  }[field] || null;
 }
 
 export function isBookingIntent({ text = "", memory = {}, modelIntent = "" } = {}) {
@@ -198,27 +301,67 @@ export function normalizeAppointmentDate(value, baseDate = new Date()) {
 }
 
 export function normalizeAppointmentTime(value) {
-  if (!value) return null;
+  return normalizeAppointmentTimeDetailed(value).time;
+}
+
+export function normalizeAppointmentTimeDetailed(value) {
+  if (!value) return timeNormalizationResult({ reason: "empty" });
   const text = String(value).trim().toLowerCase();
-  if (!text) return null;
+  if (!text) return timeNormalizationResult({ reason: "empty" });
 
   if (/^\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?$/.test(text)) {
-    return null;
+    return timeNormalizationResult({ reason: "date_only" });
   }
 
   const direct = text.match(/(?:^|[^\d])(\d{1,2}):(\d{2})(?!\d)/);
-  if (direct) return normalizeTimeParts(direct[1], direct[2]);
+  if (direct) {
+    return timeNormalizationResult({
+      time: normalizeTimeParts(direct[1], direct[2]),
+      confidence: 0.99,
+      reason: "explicit_colon_time"
+    });
+  }
+
+  const directSpace = text.match(/(?:^|[^\d])(\d{1,2})\s+(\d{2})(?!\d)/);
+  if (directSpace) {
+    return timeNormalizationResult({
+      time: normalizeTimeParts(directSpace[1], directSpace[2]),
+      confidence: 0.96,
+      reason: "explicit_spaced_time"
+    });
+  }
 
   const contextDot = text.match(/(?:^|[\s,.;])(?:в|к|ко|после|до)\s*(\d{1,2})[.-](\d{2})(?!\d)/);
-  if (contextDot) return normalizeTimeParts(contextDot[1], contextDot[2]);
+  if (contextDot) {
+    return timeNormalizationResult({
+      time: normalizeTimeParts(contextDot[1], contextDot[2]),
+      confidence: 0.95,
+      reason: "context_dot_time"
+    });
+  }
+
+  const dayPartTime = matchDayPartTime(text);
+  if (dayPartTime.time || dayPartTime.ambiguous) return dayPartTime;
 
   const hourOnly = text.match(/(?:^|[\s,.;])(?:в|к|ко|на|после|до)\s*(\d{1,2})(?:\s*(?:час(?:ов|а)?|ч))?(?!\s*[./-]\s*\d{1,2})/);
-  if (hourOnly) return normalizeTimeParts(hourOnly[1], "00");
+  if (hourOnly) return normalizeHourOnlyTime(hourOnly[1], "context_hour_only");
 
   const plainHour = text.match(/^(\d{1,2})(?:\s*(?:час(?:ов|а)?|ч))?$/);
-  if (plainHour) return normalizeTimeParts(plainHour[1], "00");
+  if (plainHour) return normalizeHourOnlyTime(plainHour[1], "plain_hour");
 
-  return null;
+  return timeNormalizationResult({ reason: "no_time" });
+}
+
+export function getAmbiguousAppointmentTimeClarification(value) {
+  const result = normalizeAppointmentTimeDetailed(value);
+  if (!result.ambiguous) return null;
+
+  return {
+    suggested_time: result.suggested_time,
+    question: result.suggested_time
+      ? `Вы имеете в виду ${result.suggested_time}?`
+      : "Уточните, пожалуйста: это утро или день/вечер?"
+  };
 }
 
 export function toIsoDate(date) {
@@ -296,25 +439,106 @@ function extractPhone(text) {
 }
 
 function extractPatientName(text) {
-  const patterns = [
-    /(?:меня зовут|мое имя|моё имя|имя)\s+([А-ЯЁA-Z][А-ЯЁа-яёA-Za-z-]{1,40})/u,
-    /меня\s+([А-ЯЁA-Z][А-ЯЁа-яёA-Za-z-]{1,40})\s+зовут/u,
-    /зовут\s+меня\s+([А-ЯЁA-Z][А-ЯЁа-яёA-Za-z-]{1,40})/u,
-    /^я\s+([А-ЯЁA-Z][А-ЯЁа-яёA-Za-z-]{1,40})$/u
-  ];
-
-  const match = patterns.map((pattern) => text.match(pattern)).find(Boolean);
-  return match ? normalizeName(match[1]) : null;
+  return extractExplicitPatientName(text)?.name || null;
 }
 
 function extractService(lower) {
   return SERVICE_MARKERS.find((item) => item.markers.some((marker) => lower.includes(marker)))?.service || null;
 }
 
-function normalizeName(name) {
-  const trimmed = String(name || "").trim();
-  if (!trimmed) return trimmed;
-  return trimmed.charAt(0).toUpperCase() + trimmed.slice(1).toLowerCase();
+function matchDayPartTime(text = "") {
+  const digitMatch = text.match(/(?:^|[\s,.;])(?:в|к|ко|на|после|до)?\s*(\d{1,2})(?:\s*(?::|[.-])\s*(\d{2}))?\s*(утра|дня|дн[её]м|вечера|вечер|ночи|ночью)(?=$|[^\p{L}\p{N}])/iu);
+  if (digitMatch) {
+    return normalizeHourWithDayPart(digitMatch[1], digitMatch[2] || "00", digitMatch[3]);
+  }
+
+  const wordMatch = text.match(/(?:^|[^\p{L}\p{N}])(один|два|три|четыре|пять|шесть|семь|восемь|девять|десять|одиннадцать|двенадцать)\s+(утра|дня|дн[её]м|вечера|вечер|ночи|ночью)(?=$|[^\p{L}\p{N}])/iu);
+  if (wordMatch) {
+    return normalizeHourWithDayPart(wordHourToNumber(wordMatch[1]), "00", wordMatch[2]);
+  }
+
+  return timeNormalizationResult({ reason: "no_day_part_time" });
+}
+
+function normalizeHourWithDayPart(hoursValue, minutesValue, dayPart) {
+  let hours = Number(hoursValue);
+  const minutes = Number(minutesValue || 0);
+  const marker = String(dayPart || "").toLowerCase();
+  if (!Number.isInteger(hours) || !Number.isInteger(minutes)) return timeNormalizationResult({ reason: "invalid_day_part_time" });
+
+  if (/(дня|дн[её]м|вечера|вечер)/iu.test(marker) && hours >= 1 && hours <= 11) {
+    hours += 12;
+  } else if (/(ночи|ночью)/iu.test(marker) && hours === 12) {
+    hours = 0;
+  }
+
+  return timeNormalizationResult({
+    time: normalizeTimeParts(hours, minutes),
+    confidence: 0.97,
+    reason: "day_part_time"
+  });
+}
+
+function normalizeHourOnlyTime(hoursValue, reason) {
+  const hours = Number(hoursValue);
+  if (!Number.isInteger(hours) || hours < 0 || hours > 23) {
+    return timeNormalizationResult({ reason: "invalid_hour_only" });
+  }
+
+  if (hours >= 1 && hours <= 7) {
+    return timeNormalizationResult({
+      time: null,
+      confidence: 0.42,
+      reason: `${reason}_ambiguous_low_hour`,
+      ambiguous: true,
+      suggested_time: normalizeTimeParts(hours + 12, "00")
+    });
+  }
+
+  return timeNormalizationResult({
+    time: normalizeTimeParts(hours, "00"),
+    confidence: 0.82,
+    reason
+  });
+}
+
+function wordHourToNumber(value = "") {
+  return {
+    один: 1,
+    два: 2,
+    три: 3,
+    четыре: 4,
+    пять: 5,
+    шесть: 6,
+    семь: 7,
+    восемь: 8,
+    девять: 9,
+    десять: 10,
+    одиннадцать: 11,
+    двенадцать: 12
+  }[String(value || "").toLowerCase()] || null;
+}
+
+function timeNormalizationResult({ time = null, confidence = 0, reason = "none", ambiguous = false, suggested_time = null } = {}) {
+  return {
+    time: time || null,
+    confidence,
+    reason,
+    ambiguous: Boolean(ambiguous),
+    suggested_time: suggested_time || null
+  };
+}
+
+function logAppointmentTimeNormalization(sourceText, result = {}) {
+  if (!result.time && !result.ambiguous) return;
+  console.log("[booking-time]", {
+    source_text: String(sourceText || "").slice(0, 160),
+    recognized_time: result.time || null,
+    suggested_time: result.suggested_time || null,
+    ambiguous: Boolean(result.ambiguous),
+    confidence: result.confidence || 0,
+    reason: result.reason || null
+  });
 }
 
 function normalizeTimeParts(hoursValue, minutesValue) {
