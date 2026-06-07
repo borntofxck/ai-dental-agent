@@ -57,6 +57,13 @@ const reminderWatcher = {
 
 app.use(express.json());
 
+function buildAgentApiHeaders(extraHeaders = {}) {
+  return {
+    ...extraHeaders,
+    ...(config.agentApiKey ? { "x-api-key": config.agentApiKey } : {})
+  };
+}
+
 app.get("/health", (req, res) => {
   res.json({ ok: true, service: "max-adapter" });
 });
@@ -1091,7 +1098,9 @@ async function runReminderWatcherTick() {
 }
 
 async function processDueReminders(limit = 20) {
-  const dueResponse = await fetch(`${config.agentApiUrl}/reminders/due?limit=${limit}`);
+  const dueResponse = await fetch(`${config.agentApiUrl}/reminders/due?limit=${limit}`, {
+    headers: buildAgentApiHeaders()
+  });
   if (!dueResponse.ok) {
     throw new Error(`Agent API reminders/due failed: ${dueResponse.status} ${await dueResponse.text()}`);
   }
@@ -1133,7 +1142,7 @@ async function markReminder(id, status, error = null) {
   const endpoint = status === "sent" ? "sent" : "failed";
   const response = await fetch(`${config.agentApiUrl}/reminders/${id}/${endpoint}`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: buildAgentApiHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({ error })
   });
 

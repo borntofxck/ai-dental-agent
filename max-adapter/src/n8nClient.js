@@ -1,11 +1,16 @@
 import { config } from "./config.js";
 
+function buildJsonHeaders() {
+  return {
+    "content-type": "application/json",
+    ...(config.agentApiKey ? { "x-api-key": config.agentApiKey } : {})
+  };
+}
+
 export async function sendIncomingMessageToN8n(message) {
   const response = await fetch(config.n8nWebhookUrl, {
     method: "POST",
-    headers: {
-      "content-type": "application/json"
-    },
+    headers: buildJsonHeaders(),
     body: JSON.stringify(message)
   });
 

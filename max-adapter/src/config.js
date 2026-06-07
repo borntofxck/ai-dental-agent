@@ -22,6 +22,7 @@ export const config = {
   maxWebUrl: process.env.MAX_WEB_URL || "https://web.max.ru/",
   n8nWebhookUrl: process.env.N8N_WEBHOOK_URL || "http://localhost:5678/webhook/incoming-message",
   agentApiUrl: process.env.AGENT_API_URL || "http://localhost:3002",
+  agentApiKey: process.env.AGENT_API_KEY || "",
   maxPollIntervalMs: Number(process.env.MAX_POLL_INTERVAL_MS || 5000),
   maxWorkerIntervalMs: Number(process.env.MAX_WORKER_INTERVAL_MS || 1500),
   maxScanChatsPerTick: Number(process.env.MAX_SCAN_CHATS_PER_TICK || 8),
