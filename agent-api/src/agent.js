@@ -109,6 +109,12 @@ const productionOutputPrompt = `
 - Отличай стоматологическую услугу от отмены записи. "Удалить зуб", "удаление зуба", "удалить зуб мудрости", "вырвать зуб", "зуб мудрости удалить" = услуга tooth_extraction/wisdom_tooth_extraction, а не cancel. Cancel только когда клиент явно говорит про запись, прием, визит или бронь: "удалите запись", "отмените прием", "не приду", "запись не нужна".
 - Если есть слово "удалить" рядом с "зуб/зуб мудрости/восьмерка/корень/нерв", extracted.service_category должен быть tooth_extraction или wisdom_tooth_extraction.
 - Если вопрос медицинский, срочный или рискованный, не ставь диагноз. Предложи связаться с администратором/врачом; при отеке, температуре, травме, кровотечении, сильной боли, проблемах с дыханием или глотанием urgency = "high", should_handoff = true.
+- Тон reply тёплый, спокойный и профессиональный, как у живого администратора в переписке: короткие живые фразы, обычно 1-3 предложения.
+- Имя клиента используй естественно и изредка, не в каждом сообщении и без фамилии.
+- Варьируй начала реплик, не повторяй одинаковые фразы подряд.
+- Где уместно, используй лёгкие человеческие подтверждения: "Поняла вас", "Хорошо, подскажу", "Сейчас уточню".
+- При боли или тревоге коротко признай состояние ("Понимаю, это неприятно") и сразу переходи к делу.
+- Эмодзи по умолчанию не используй (это медицина), максимум крайне редко и только уместно.
 `;
 
 const agentArchitecturePrompt = `
@@ -1188,8 +1194,12 @@ export async function classifyUserIntentWithLLM({
   }
 }
 
-export async function humanizeReplyWithAI({ safeReply, userMessage = "", action = "none", state = "idle" } = {}) {
+export async function humanizeReplyWithAI({ safeReply, userMessage = "", action = "none", state = "idle", recentReplies = [] } = {}) {
   const originalReply = String(safeReply || "").trim();
+  const previousReplies = (Array.isArray(recentReplies) ? recentReplies : [])
+    .map((value) => String(value || "").trim())
+    .filter(Boolean)
+    .slice(-2);
   if (!originalReply) {
     return {
       reply: originalReply,
@@ -1241,7 +1251,7 @@ export async function humanizeReplyWithAI({ safeReply, userMessage = "", action 
   try {
     const response = await groq.chat.completions.create({
       model,
-      temperature: 0.35,
+      temperature: config.humanizerTemperature ?? 0.35,
       max_tokens: config.humanizerMaxTokens || 140,
       response_format: { type: "json_object" },
       messages: [
@@ -1254,6 +1264,11 @@ export async function humanizeReplyWithAI({ safeReply, userMessage = "", action 
             "Нельзя добавлять обещания, которых нет в исходном safeReply.",
             "Если safeReply говорит, что запись не создается, нельзя писать, что запись создана или что пациента ждут.",
             "Если safeReply передает конфликт, цену, жалобу или угрозу администратору, сохрани этот смысл и не спорь с клиентом.",
+            "Тон тёплый, спокойный и профессиональный, как у живого администратора в переписке.",
+            "Имя клиента используй естественно и изредка, не в каждом сообщении и без фамилии; варьируй начало реплики.",
+            "В previousReplies — твои недавние ответы. Не начинай так же, как они, и не повторяй имя клиента, если оно уже было в предыдущем ответе.",
+            "Если клиент пишет про боль или тревогу, можно коротко посочувствовать ('Понимаю, это неприятно') и сразу к делу.",
+            "Эмодзи по умолчанию не добавляй (это медицина).",
             "Итог: 1-3 коротких предложения, без JSON/intent/action/memory/tool/system/reasoning в reply."
           ].join("\n")
         },
@@ -1263,7 +1278,8 @@ export async function humanizeReplyWithAI({ safeReply, userMessage = "", action 
             safeReply: originalReply,
             userMessage,
             action,
-            state
+            state,
+            previousReplies
           })
         }
       ]

@@ -191,8 +191,73 @@ export async function getAnnualHygieneRecipients({ limit = 200 } = {}) {
   return recipients;
 }
 
+export async function getContactAudience(rawFilters = {}) {
+  const filters = {
+    activeWithinDays: Number(rawFilters.activeWithinDays || rawFilters.active_within_days || 0) || null,
+    inactiveForDays: Number(rawFilters.inactiveForDays || rawFilters.inactive_for_days || 0) || null,
+    excludeHandoff: rawFilters.excludeHandoff !== false && rawFilters.exclude_handoff !== false,
+    requireConversation: rawFilters.requireConversation !== false && rawFilters.require_conversation !== false,
+    limit: toLimit(rawFilters.limit, 500)
+  };
+
+  const contacts = await prisma.contact.findMany({
+    where: { maxUserId: { not: "" } },
+    orderBy: { updatedAt: "desc" },
+    take: Math.max(filters.limit * 3, filters.limit),
+    include: {
+      completedVisits: {
+        orderBy: { visitDate: "desc" },
+        take: 1,
+        include: { service: true, doctor: true }
+      },
+      conversations: {
+        orderBy: { lastMessageAt: "desc" },
+        take: 1,
+        include: { memory: true }
+      }
+    }
+  });
+
+  const now = new Date();
+  const recipients = [];
+
+  for (const contact of contacts) {
+    const conversation = contact.conversations?.[0] || null;
+    if (filters.requireConversation && !conversation) continue;
+
+    const status = conversation?.status || null;
+    if (filters.excludeHandoff && ["human_takeover", "handoff_required"].includes(status)) continue;
+
+    const lastActivity = conversation?.lastMessageAt
+      ? new Date(conversation.lastMessageAt)
+      : (contact.updatedAt ? new Date(contact.updatedAt) : null);
+
+    if (filters.activeWithinDays && lastActivity) {
+      // оставить только тех, кто писал не позднее N дней назад
+      if (lastActivity < addDays(now, -filters.activeWithinDays)) continue;
+    }
+    if (filters.inactiveForDays && lastActivity) {
+      // оставить только тех, кто молчит не меньше N дней
+      if (lastActivity > addDays(now, -filters.inactiveForDays)) continue;
+    }
+
+    const memory = conversation?.memory?.memory || {};
+    const lastVisit = contact.completedVisits?.[0] || null;
+    recipients.push({
+      ...buildRecipient(contact, lastVisit, memory),
+      conversation_status: status,
+      last_activity: lastActivity ? toIsoDate(lastActivity) : null
+    });
+    if (recipients.length >= filters.limit) break;
+  }
+
+  return recipients;
+}
+
 export async function queueBroadcast({ name, prompt, filters = {}, type = "broadcast", useAi = false }) {
-  const recipients = await getBroadcastRecipients(filters);
+  const recipients = filters.mode === "contacts"
+    ? await getContactAudience(filters)
+    : await getBroadcastRecipients(filters);
   return createCampaignWithMessages({
     name,
     prompt,
@@ -298,7 +363,7 @@ export async function queueManualBroadcast({
           chatName: recipient.display_name || null,
           recipientName: recipient.patient_name || recipient.display_name || null,
           type: "manual_broadcast",
-          priority: 80,
+          priority: 40,
           dedupeKey: `manual:${hash}:${recipient.contact_id}`,
           prompt: safeMessage,
           messageText: recipient.preview,
@@ -473,7 +538,7 @@ async function createCampaignWithMessages({ name, prompt, filters, type, recipie
           chatName: recipient.display_name || null,
           recipientName: recipient.patient_name || recipient.display_name || null,
           type,
-          priority: type === "annual_hygiene" ? 60 : 70,
+          priority: type === "annual_hygiene" ? 80 : 60,
           dedupeKey,
           prompt: safePrompt,
           messageText,
@@ -577,7 +642,7 @@ function buildRecipient(contact, lastVisit, memory = {}) {
     contact_id: contact.id,
     chat_id: contact.maxUserId,
     display_name: contact.displayName || null,
-    patient_name: memory.patient_name || lastVisit?.patientName || contact.displayName || null,
+    patient_name: contact.patientName || memory.patient_name || lastVisit?.patientName || contact.displayName || null,
     phone: contact.phone || lastVisit?.phone || memory.phone || null,
     last_service: lastVisit?.service?.name || lastVisit?.serviceName || null,
     last_visit_date: toIsoDate(lastVisit?.visitDate),

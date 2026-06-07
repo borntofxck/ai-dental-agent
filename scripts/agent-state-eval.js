@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import {
   avoidRepeatedBotReply,
+  buildRescheduleCandidateMemory,
+  buildRescheduleConfirmationReply,
+  buildRescheduleConfirmedReply,
   buildSafeScriptedReply,
   canResumeAiFromHumanTakeover,
   classifyConversationRisk,
@@ -31,6 +34,55 @@ assert.equal(cancel.state, "cancellation_requested");
 
 const reschedule = detectConversationIntent("можно на другое время?");
 assert.equal(reschedule.intent, "reschedule", "reschedule must be detected when no cancel phrase exists");
+
+const activeConfirmedAppointment = {
+  id: 77,
+  status: "confirmed",
+  patientName: "Анна",
+  phone: "+79000000000",
+  requestedService: "гигиена",
+  preferredDate: "2026-06-10",
+  preferredTime: "11:00",
+  preferredDoctor: "Дмитрий Алексеевич"
+};
+const rescheduleDateDraft = buildRescheduleCandidateMemory({
+  baseMemory: {
+    status: "appointment_booked",
+    preferred_date: "2026-06-10",
+    preferred_time: "11:00",
+    requested_service: "гигиена",
+    preferred_doctor: "Дмитрий Алексеевич"
+  },
+  activeAppointment: activeConfirmedAppointment,
+  deterministicFacts: { preferred_date: "2026-06-17" },
+  payload: { display_name: "Анна" }
+});
+assert.equal(rescheduleDateDraft.preferred_date, "2026-06-17");
+assert.equal(rescheduleDateDraft.preferred_time, undefined, "reschedule draft must not reuse old appointment time as a new candidate");
+assert.equal(rescheduleDateDraft.pending_reschedule.status, "collecting_datetime");
+
+const rescheduleReadyDraft = buildRescheduleCandidateMemory({
+  baseMemory: rescheduleDateDraft,
+  activeAppointment: activeConfirmedAppointment,
+  deterministicFacts: { preferred_time: "15:00" },
+  payload: { display_name: "Анна" }
+});
+assert.equal(rescheduleReadyDraft.preferred_date, "2026-06-17");
+assert.equal(rescheduleReadyDraft.preferred_time, "15:00");
+assert.equal(rescheduleReadyDraft.pending_reschedule.status, "awaiting_confirmation");
+assert.match(
+  buildRescheduleConfirmationReply({ memory: rescheduleReadyDraft, payload: { display_name: "Анна" }, messageText: "на 15:00" }),
+  /17\.06\.2026.*15:00.*Подтверждаете/iu
+);
+assert.match(
+  buildRescheduleConfirmedReply({
+    appointmentRequest: { ...activeConfirmedAppointment, preferredDate: "2026-06-17", preferredTime: "15:00" },
+    memory: rescheduleReadyDraft,
+    payload: { display_name: "Анна" },
+    messageText: "да"
+  }),
+  /перенес/iu
+);
 
 const angry = detectConversationIntent("зачем вы меня записали, я не просил");
 assert.equal(angry.intent, "cancel");

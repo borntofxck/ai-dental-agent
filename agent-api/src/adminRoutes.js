@@ -5,6 +5,7 @@ import { processIncomingMessage } from "./messageService.js";
 import {
   getAnnualHygieneRecipients,
   getBroadcastRecipients,
+  getContactAudience,
   getOutboundQueue,
   queueAnnualHygieneBroadcast,
   queueBroadcast,
@@ -183,6 +184,7 @@ export function createAdminRouter() {
       ...(search
         ? {
             OR: [
+              { contact: { patientName: { contains: search, mode: "insensitive" } } },
               { contact: { displayName: { contains: search, mode: "insensitive" } } },
               { contact: { maxUserId: { contains: search, mode: "insensitive" } } },
               { messages: { some: { text: { contains: search, mode: "insensitive" } } } }
@@ -280,6 +282,7 @@ export function createAdminRouter() {
               { phone: { contains: search, mode: "insensitive" } },
               { complaint: { contains: search, mode: "insensitive" } },
               { requestedService: { contains: search, mode: "insensitive" } },
+              { contact: { patientName: { contains: search, mode: "insensitive" } } },
               { contact: { displayName: { contains: search, mode: "insensitive" } } },
               { contact: { maxUserId: { contains: search, mode: "insensitive" } } }
             ]
@@ -352,15 +355,26 @@ export function createAdminRouter() {
     const page = toPage(req.query.page);
     const pageSize = toPageSize(req.query.page_size || req.query.limit, 25, 100);
     const fetchLimit = 1000;
-    const recipients = req.query.annual_hygiene === "true"
-      ? await getAnnualHygieneRecipients({ limit: fetchLimit })
-      : await getBroadcastRecipients({
-          serviceQuery: req.query.service_query,
-          visitedBeforeDays: req.query.visited_before_days,
-          visitedAfterDays: req.query.visited_after_days,
-          onlyWithVisits: req.query.only_with_visits === "true",
-          limit: fetchLimit
-        });
+    const mode = String(req.query.mode || "").trim();
+    let recipients;
+    if (req.query.annual_hygiene === "true" || mode === "annual_hygiene") {
+      recipients = await getAnnualHygieneRecipients({ limit: fetchLimit });
+    } else if (mode === "contacts") {
+      recipients = await getContactAudience({
+        activeWithinDays: req.query.active_within_days,
+        inactiveForDays: req.query.inactive_for_days,
+        excludeHandoff: req.query.include_handoff !== "true",
+        limit: fetchLimit
+      });
+    } else {
+      recipients = await getBroadcastRecipients({
+        serviceQuery: req.query.service_query,
+        visitedBeforeDays: req.query.visited_before_days,
+        visitedAfterDays: req.query.visited_after_days,
+        onlyWithVisits: req.query.only_with_visits === "true",
+        limit: fetchLimit
+      });
+    }
     const total = recipients.length;
     const pageItems = recipients.slice((page - 1) * pageSize, page * pageSize);
 

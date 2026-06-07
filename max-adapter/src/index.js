@@ -42,7 +42,8 @@ const watcher = {
   startedAt: null,
   lastScanResult: null,
   lastWorkerResult: null,
-  lastError: null
+  lastError: null,
+  browserClosedLogged: false
 };
 const reminderWatcher = {
   timer: null,
@@ -352,6 +353,7 @@ async function runScannerTick(options = {}) {
   watcher.scanning = true;
 
   try {
+    await maxClient.ensureAlive();
     const result = watcher.mode === "active"
       ? await enqueueActiveChatMessage({ limit: 20, force: Boolean(options.force), throwIfNoMessage: false })
       : await scanChatsToQueue({
@@ -362,14 +364,30 @@ async function runScannerTick(options = {}) {
         });
     watcher.lastScanResult = { ...result, checked_at: new Date().toISOString() };
     watcher.lastError = null;
+    watcher.browserClosedLogged = false;
     return watcher.lastScanResult;
   } catch (error) {
     watcher.lastError = error.message;
-    console.error("MAX scanner failed:", error);
+    if (isBrowserClosedError(error)) {
+      // Browser/page died mid-scan. Flag for recovery and log once per outage
+      // instead of dumping the same stack on every tick.
+      maxClient.needsRestart = true;
+      if (!watcher.browserClosedLogged) {
+        console.error("MAX scanner hit a closed browser; auto-recovery will retry:", error.message);
+        watcher.browserClosedLogged = true;
+      }
+    } else {
+      console.error("MAX scanner failed:", error);
+    }
     return { ok: false, error: error.message };
   } finally {
     watcher.scanning = false;
   }
+}
+
+function isBrowserClosedError(error) {
+  const message = String(error?.message || "");
+  return /has been closed|target closed|target page, context or browser|browser has been closed|page\.evaluate.*closed/iu.test(message);
 }
 
 async function runQueueWorkerTick() {

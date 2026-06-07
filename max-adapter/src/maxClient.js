@@ -8,23 +8,138 @@ export class MaxClient {
     this.context = null;
     this.page = null;
     this.startedAt = null;
+    // watchdog state
+    this.needsRestart = false;
+    this.restarting = null;      // in-flight restart promise (race guard)
+    this.restartAttempts = 0;    // drives exponential backoff
   }
 
   async start() {
-    if (this.context) return;
+    // Wait out an in-flight restart instead of launching a second browser.
+    if (this.restarting) {
+      await this.restarting;
+      return;
+    }
 
+    // A non-null context may still be dead — check real liveness, not just presence.
+    if (await this._isHealthy()) return;
+
+    await this._teardown();
+    await this._launch();
+    this.restartAttempts = 0;
+    this.needsRestart = false;
+  }
+
+  // Actual browser launch — shared by start() and _restart().
+  async _launch() {
     this.context = await chromium.launchPersistentContext(config.userDataDir, {
       headless: config.headless,
       viewport: { width: 1366, height: 768 }
     });
 
     this.page = this.context.pages()[0] || await this.context.newPage();
+    this._attachLifecycleListeners();
     await this.page.goto(config.maxWebUrl, { waitUntil: "domcontentloaded" });
     this.startedAt = new Date();
 
     console.log(`MAX web opened at ${config.maxWebUrl}`);
     console.log(`MAX browser profile: ${config.userDataDir}`);
     console.log("Log in manually if MAX asks for authentication.");
+  }
+
+  // Mark the client dead the moment Playwright tears down page/context/browser,
+  // so the scanner stops poking a closed object and a restart is triggered.
+  _attachLifecycleListeners() {
+    const page = this.page;
+    const context = this.context;
+
+    page.on("close", () => {
+      if (this.page === page) {
+        this.page = null;
+        this.needsRestart = true;
+      }
+    });
+
+    context.on("close", () => {
+      if (this.context === context) {
+        this.context = null;
+        this.page = null;
+        this.needsRestart = true;
+      }
+    });
+
+    const browser = context.browser();
+    if (browser) {
+      browser.on("disconnected", () => {
+        if (this.context === context) {
+          this.context = null;
+          this.page = null;
+          this.needsRestart = true;
+        }
+      });
+    }
+  }
+
+  // Structural check + a 3s health probe against the live page.
+  async _isHealthy() {
+    if (this.needsRestart) return false;
+    if (!this.context || !this.page) return false;
+    if (this.page.isClosed?.()) return false;
+
+    try {
+      await Promise.race([
+        this.page.evaluate(() => 1),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("health-check timeout")), 3000))
+      ]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // Recover the browser if it is gone. Safe to call on every scanner tick:
+  // concurrent callers share one in-flight restart instead of spawning browsers.
+  async ensureAlive() {
+    if (this.restarting) {
+      await this.restarting;
+      return;
+    }
+
+    if (await this._isHealthy()) return;
+
+    this.restarting = this._restart();
+    try {
+      await this.restarting;
+    } finally {
+      this.restarting = null;
+    }
+  }
+
+  async _restart() {
+    await this._teardown();
+
+    // Exponential backoff (1s→2s→…→30s). First attempt runs immediately;
+    // repeated failures back off so a persistent error never tight-loops.
+    if (this.restartAttempts > 0) {
+      const backoffMs = Math.min(30000, 1000 * 2 ** (this.restartAttempts - 1));
+      await new Promise((resolve) => setTimeout(resolve, backoffMs));
+    }
+    this.restartAttempts += 1;
+
+    await this._launch();
+
+    this.restartAttempts = 0;
+    this.needsRestart = false;
+    console.log("MAX browser recovered after close");
+  }
+
+  async _teardown() {
+    const context = this.context;
+    this.page = null;
+    this.context = null;
+    if (context) {
+      await context.close().catch(() => {});
+    }
   }
 
   ensureStarted() {
@@ -358,10 +473,11 @@ export class MaxClient {
   }
 
   async stop() {
-    await this.context?.close();
-    this.context = null;
-    this.page = null;
+    await this._teardown();
     this.startedAt = null;
+    this.needsRestart = false;
+    this.restartAttempts = 0;
+    this.restarting = null;
   }
 }
 

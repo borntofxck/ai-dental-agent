@@ -122,12 +122,22 @@ async function api(path, options = {}) {
     }
   });
 
+  if (response.status === 401) {
+    window.location.href = "/admin/login";
+    throw new Error("Требуется вход");
+  }
+
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     throw new Error(data.error || `HTTP ${response.status}`);
   }
 
   return data;
+}
+
+async function logout() {
+  await fetch("/api/admin/logout", { method: "POST" });
+  window.location.href = "/admin/login";
 }
 
 function toast(message) {
@@ -212,7 +222,7 @@ async function loadDashboard() {
     ? latestMessages.map((message) => `
       <button class="list-item" data-open-conversation="${message.conversationId}">
         <div class="d-flex justify-content-between gap-3">
-          <strong>${escapeHtml(message.contact?.displayName || message.contact?.maxUserId || `Контакт ${message.contactId}`)}</strong>
+          <strong>${escapeHtml(message.contact?.patientName || message.contact?.displayName || message.contact?.maxUserId || `Контакт ${message.contactId}`)}</strong>
           <span class="small-muted">${formatDateTime(message.createdAt)}</span>
         </div>
         <div class="small-muted">${escapeHtml(message.direction)} / ${escapeHtml(message.role)}</div>
@@ -240,7 +250,7 @@ async function loadConversations() {
         return `
           <button class="conversation-item ${active}" data-conversation-id="${conversation.id}">
             <div class="d-flex justify-content-between gap-2">
-              <strong>${escapeHtml(contact.displayName || contact.maxUserId || `Контакт ${conversation.contactId}`)}</strong>
+              <strong>${escapeHtml(contact.patientName || contact.displayName || contact.maxUserId || `Контакт ${conversation.contactId}`)}</strong>
               <span class="small-muted">#${conversation.id}</span>
             </div>
             <div class="small-muted">${escapeHtml(contact.maxUserId || "-")} · ${formatDateTime(conversation.lastMessageAt)}</div>
@@ -270,7 +280,7 @@ async function loadConversation(id) {
     <div class="panel-title">
       <div class="d-flex justify-content-between gap-3">
         <div>
-          <div class="fw-semibold">${escapeHtml(contact.displayName || contact.maxUserId || `Контакт ${conversation.contactId}`)}</div>
+          <div class="fw-semibold">${escapeHtml(contact.patientName || contact.displayName || contact.maxUserId || `Контакт ${conversation.contactId}`)}</div>
           <div class="small-muted">${escapeHtml(contact.maxUserId || "-")} · ${escapeHtml(conversation.channel || "-")}</div>
         </div>
         <div class="d-flex align-items-start gap-2">
@@ -397,19 +407,33 @@ function getBroadcastFilterPayload() {
     visitedBeforeDays: $("#broadcastVisitedBefore").value,
     visitedAfterDays: $("#broadcastVisitedAfter").value,
     onlyWithVisits: $("#broadcastOnlyWithVisits").checked,
+    activeWithinDays: $("#broadcastActiveWithin").value,
+    inactiveForDays: $("#broadcastInactiveFor").value,
+    includeHandoff: $("#broadcastIncludeHandoff").checked,
     pageSize: Number($("#broadcastPageSize").value || 25)
   };
+}
+
+function syncBroadcastModeFields() {
+  const mode = $("#broadcastMode").value;
+  $all("[data-mode-group]").forEach((node) => {
+    node.style.display = node.dataset.modeGroup === mode ? "" : "none";
+  });
 }
 
 async function loadBroadcastRecipients() {
   const filters = getBroadcastFilterPayload();
   state.broadcast.recipientsPageSize = filters.pageSize;
   const query = buildQuery({
+    mode: filters.mode,
     annual_hygiene: filters.mode === "annual_hygiene" ? "true" : "",
     service_query: filters.mode === "custom" ? filters.serviceQuery : "",
     visited_before_days: filters.mode === "custom" ? filters.visitedBeforeDays : "",
     visited_after_days: filters.mode === "custom" ? filters.visitedAfterDays : "",
     only_with_visits: filters.mode === "custom" && filters.onlyWithVisits ? "true" : "",
+    active_within_days: filters.mode === "contacts" ? filters.activeWithinDays : "",
+    inactive_for_days: filters.mode === "contacts" ? filters.inactiveForDays : "",
+    include_handoff: filters.mode === "contacts" && filters.includeHandoff ? "true" : "",
     page: state.broadcast.recipientsPage,
     page_size: state.broadcast.recipientsPageSize
   });
@@ -439,7 +463,7 @@ function renderBroadcastRecipients() {
           </td>
           <td>${escapeHtml(recipient.chat_id || "-")}</td>
           <td>${escapeHtml(recipient.last_service || "-")}</td>
-          <td>${escapeHtml(recipient.last_visit_date || "-")}</td>
+          <td>${escapeHtml(recipient.last_visit_date || recipient.last_activity || "-")}</td>
         </tr>
       `;
     }).join("")
@@ -527,13 +551,21 @@ async function createBroadcastCampaign() {
     : {
         name: $("#broadcastName").value,
         prompt: $("#broadcastPrompt").value,
-        filters: {
-          serviceQuery: filters.serviceQuery,
-          visitedBeforeDays: Number(filters.visitedBeforeDays || 0),
-          visitedAfterDays: Number(filters.visitedAfterDays || 0),
-          onlyWithVisits: filters.onlyWithVisits,
-          limit: 200
-        },
+        filters: filters.mode === "contacts"
+          ? {
+              mode: "contacts",
+              activeWithinDays: Number(filters.activeWithinDays || 0),
+              inactiveForDays: Number(filters.inactiveForDays || 0),
+              excludeHandoff: !filters.includeHandoff,
+              limit: 500
+            }
+          : {
+              serviceQuery: filters.serviceQuery,
+              visitedBeforeDays: Number(filters.visitedBeforeDays || 0),
+              visitedAfterDays: Number(filters.visitedAfterDays || 0),
+              onlyWithVisits: filters.onlyWithVisits,
+              limit: 200
+            },
         type: "broadcast",
         use_ai: $("#broadcastUseAi").checked
       };
@@ -676,6 +708,8 @@ function bindEvents() {
     pageLoaders[state.activePage]?.().then(() => toast("Обновлено")).catch(showError);
   });
 
+  $("#logoutButton").addEventListener("click", () => logout().catch(showError));
+
   $("#copyReportButton").addEventListener("click", async () => {
     await navigator.clipboard.writeText($("#todayReport").textContent);
     toast("Отчет скопирован");
@@ -745,6 +779,12 @@ function bindEvents() {
 
   $("#broadcastRecipientForm").addEventListener("submit", (event) => {
     event.preventDefault();
+    state.broadcast.recipientsPage = 1;
+    loadBroadcastRecipients().catch(showError);
+  });
+
+  $("#broadcastMode").addEventListener("change", () => {
+    syncBroadcastModeFields();
     state.broadcast.recipientsPage = 1;
     loadBroadcastRecipients().catch(showError);
   });
@@ -828,4 +868,5 @@ function bindEvents() {
 }
 
 bindEvents();
+syncBroadcastModeFields();
 setPage("dashboard");

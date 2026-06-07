@@ -20,6 +20,7 @@
         <span class="status-pill" id="healthPill">проверка</span>
         <button class="btn btn-sm btn-outline-secondary" id="refreshAllButton" type="button">Обновить</button>
         <a class="btn btn-sm btn-primary" href="/health" target="_blank" rel="noreferrer">Health</a>
+        <button class="btn btn-sm btn-outline-danger" id="logoutButton" type="button">Выйти</button>
       </div>
     </nav>
 
@@ -168,19 +169,28 @@
                 <label>
                   <span>Тип подбора</span>
                   <select class="form-select" id="broadcastMode">
+                    <option value="contacts" selected>Все контакты (по активности)</option>
                     <option value="annual_hygiene">Годовая профгигиена</option>
-                    <option value="custom">Ручной фильтр</option>
+                    <option value="custom">Ручной фильтр по визитам</option>
                   </select>
                 </label>
-                <label>
+                <label data-mode-group="contacts">
+                  <span>Писали за, дней (необязательно)</span>
+                  <input class="form-control" id="broadcastActiveWithin" type="number" min="1" placeholder="напр. 90">
+                </label>
+                <label data-mode-group="contacts">
+                  <span>Молчат от, дней (необязательно)</span>
+                  <input class="form-control" id="broadcastInactiveFor" type="number" min="1" placeholder="напр. 30">
+                </label>
+                <label data-mode-group="custom">
                   <span>Услуга содержит</span>
                   <input class="form-control" id="broadcastServiceQuery" value="гигиен">
                 </label>
-                <label>
+                <label data-mode-group="custom">
                   <span>Были раньше, дней</span>
                   <input class="form-control" id="broadcastVisitedBefore" type="number" min="1" value="365">
                 </label>
-                <label>
+                <label data-mode-group="custom">
                   <span>Были позже, дней</span>
                   <input class="form-control" id="broadcastVisitedAfter" type="number" min="1">
                 </label>
@@ -192,9 +202,13 @@
                     <option value="50">50</option>
                   </select>
                 </label>
-                <label class="check-row">
+                <label class="check-row" data-mode-group="custom">
                   <input class="form-check-input" id="broadcastOnlyWithVisits" type="checkbox" checked>
                   <span>только с визитами</span>
+                </label>
+                <label class="check-row" data-mode-group="contacts">
+                  <input class="form-check-input" id="broadcastIncludeHandoff" type="checkbox">
+                  <span>включать диалоги на операторе</span>
                 </label>
                 <div class="form-actions">
                   <button class="btn btn-primary" type="submit">Подобрать</button>

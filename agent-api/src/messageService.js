@@ -742,6 +742,41 @@ function isOutgoingPayload(payload = {}) {
   return direction === "outgoing" || direction === "assistant" || role === "assistant";
 }
 
+// Поднимаем настоящую личность пациента в карточку контакта:
+// имя — только если пациент сам себя назвал; телефон — дозаполняем, если пусто.
+// displayName не трогаем — это имя канала (MAX).
+async function promoteContactIdentity({ contact, memory = {}, payload = {} }) {
+  if (!contact?.id) return contact;
+  const updates = {};
+
+  const explicitName = normalizeName(memory.patient_name || memory.booking_state?.patient_name || "");
+  const explicitSource = memory.patient_name_source || memory.booking_state?.patient_name_source || null;
+  if (
+    explicitName &&
+    explicitSource === "explicit_user_name" &&
+    !isKnownClinicPersonName(explicitName) &&
+    explicitName !== contact.patientName
+  ) {
+    updates.patientName = explicitName;
+  }
+
+  const phone = cleanScalar(memory.phone || payload.phone || "");
+  if (phone && !contact.phone) {
+    updates.phone = phone;
+  }
+
+  if (!Object.keys(updates).length) return contact;
+  try {
+    return await prisma.contact.update({
+      where: { id: contact.id },
+      data: { ...updates, updatedAt: new Date() }
+    });
+  } catch (error) {
+    console.warn("[contact] identity promotion failed:", error.message);
+    return contact;
+  }
+}
+
 export async function processIncomingMessage(input) {
   const rawPayload = input?.body && !input.message_text ? input.body : input;
   const payload = normalizeIncomingPayload(rawPayload);
@@ -1013,6 +1048,27 @@ export async function processIncomingMessage(input) {
       guard: riskGuard
     });
   }
+  const deterministicFacts = postValidateMemoryNameRoles(extractBookingFacts(messageText), {
+    messageText,
+    payload,
+    strictPatientSource: true
+  });
+  const rescheduleTurn = await handleRescheduleFlow({
+    contact,
+    conversation,
+    incomingMessage,
+    externalMessageId,
+    payload,
+    messageText,
+    baseMemory,
+    activeAppointment,
+    guard: hardGuardIntent,
+    deterministicFacts
+  });
+  if (rescheduleTurn) {
+    return rescheduleTurn;
+  }
+
   const conversationIntent = hardGuardIntent;
   const guardedTurn = await buildPostClassifierGuard({
     guard: hardGuardIntent,
@@ -1036,11 +1092,6 @@ export async function processIncomingMessage(input) {
       guard: guardedTurn
     });
   }
-  const deterministicFacts = postValidateMemoryNameRoles(extractBookingFacts(messageText), {
-    messageText,
-    payload,
-    strictPatientSource: true
-  });
   const awaitingBookingConfirmation = isAwaitingBookingConfirmation(baseMemory);
   const explicitBookingConfirmation = hasExplicitBookingConfirmation(messageText) ||
     (awaitingBookingConfirmation && isBookingConfirmationText(messageText));
@@ -1128,7 +1179,7 @@ export async function processIncomingMessage(input) {
     bookingIntent,
     informationQuestion: isInformationQuestion(messageText)
   });
-  const postBookingSocialReply = hasConfirmedBooking
+  const postBookingSocialReply = hasConfirmedBooking && !looksLikeUserQuestion(messageText)
     ? buildPostBookingSocialReply({ messageText, appointmentRequest: activeAppointment, memory: nextMemory })
     : null;
   const missingBookingFields = normalizeBookingMissingFieldsForState(
@@ -1234,6 +1285,8 @@ export async function processIncomingMessage(input) {
     agentResult: safeAgentResult,
     missingFields: appointmentValidation.missing_fields
   });
+
+  await promoteContactIdentity({ contact, memory: nextMemory, payload });
 
   let finalReply = safeAgentResult.reply;
   let replySource = "agent";
@@ -1500,6 +1553,536 @@ function summarizeAgentOutput(agentResult = {}) {
   };
 }
 
+function getPendingReschedule(memory = {}) {
+  return isPlainObject(memory.pending_reschedule) ? memory.pending_reschedule : null;
+}
+
+function isRescheduleFlowRequested({ guard = {}, memory = {}, activeAppointment = null, facts = {}, messageText = "" } = {}) {
+  if (activeAppointment?.status !== "confirmed") return false;
+  if (["cancel", "abuse", "noise", "handoff"].includes(guard?.intent)) return false;
+
+  const pending = getPendingReschedule(memory);
+  const hasNewSlotFacts = Boolean(facts.preferred_date || facts.preferred_time || facts.preferred_doctor);
+  const hasConfirmation = facts.confirmation === true ||
+    facts.consent_to_book === true ||
+    hasExplicitBookingConfirmation(messageText) ||
+    isBookingConfirmationText(messageText);
+
+  if (guard?.intent === "reschedule") return true;
+  if (!pending && memory.status !== "reschedule_requested") return false;
+  if (!pending && !hasNewSlotFacts && !hasConfirmation) return false;
+  if (pending && !hasNewSlotFacts && !hasConfirmation && isInformationQuestion(messageText)) return false;
+
+  return Boolean(pending || memory.status === "reschedule_requested" || hasNewSlotFacts || hasConfirmation);
+}
+
+function isNegativeRescheduleConfirmation(text = "") {
+  return /^(нет|неа|не\s+надо|не\s+нужно|не\s+подходит|не\s+то|отмена|передумал[аи]?)(?:[\s.!?]+|$)/iu.test(String(text || "").trim()) ||
+    /(не\s+подходит|другое\s+время|другой\s+день|позже|раньше|давайте\s+другое)/iu.test(String(text || ""));
+}
+
+function resolveRescheduleCandidateValue({ facts = {}, pending = {}, field }) {
+  if (facts[field]) return facts[field];
+  if (pending?.[field]) return pending[field];
+  return null;
+}
+
+export function buildRescheduleCandidateMemory({
+  baseMemory = {},
+  activeAppointment = null,
+  deterministicFacts = {},
+  payload = {},
+  keepCandidate = true
+} = {}) {
+  const pending = keepCandidate ? getPendingReschedule(baseMemory) : null;
+  const preferredDate = normalizeAppointmentDate(resolveRescheduleCandidateValue({
+    facts: deterministicFacts,
+    pending,
+    field: "preferred_date"
+  }));
+  const preferredTime = normalizeAppointmentTime(resolveRescheduleCandidateValue({
+    facts: deterministicFacts,
+    pending,
+    field: "preferred_time"
+  }));
+  const preferredDoctor = deterministicFacts.preferred_doctor ||
+    pending?.preferred_doctor ||
+    baseMemory.preferred_doctor ||
+    activeAppointment?.preferredDoctor ||
+    null;
+  const nextMemory = clearAppointmentDraft(baseMemory);
+  const patientName = getSafePatientName(baseMemory, payload, activeAppointment?.patientName || "") ||
+    baseMemory.patient_name ||
+    activeAppointment?.patientName ||
+    null;
+  const patientNameSource = baseMemory.patient_name_source ||
+    baseMemory.booking_state?.patient_name_source ||
+    (patientName === normalizeChannelProfileName(payload.display_name) ? "channel_profile" : null);
+  const phone = normalizeAppointmentPhone(baseMemory.phone) ||
+    normalizeAppointmentPhone(activeAppointment?.phone) ||
+    normalizeAppointmentPhone(payload.phone);
+  const requestedService = baseMemory.requested_service ||
+    baseMemory.complaint ||
+    activeAppointment?.requestedService ||
+    activeAppointment?.complaint ||
+    "прием";
+
+  nextMemory.status = "reschedule_requested";
+  nextMemory.intent = "book_appointment";
+  nextMemory.requested_service = requestedService;
+  nextMemory.complaint = baseMemory.complaint || activeAppointment?.complaint || requestedService;
+  if (patientName) nextMemory.patient_name = patientName;
+  if (patientNameSource) nextMemory.patient_name_source = patientNameSource;
+  if (phone) nextMemory.phone = phone;
+  if (preferredDate) nextMemory.preferred_date = toBookingIsoDate(preferredDate);
+  if (preferredTime) nextMemory.preferred_time = preferredTime;
+  if (preferredDoctor) nextMemory.preferred_doctor = preferredDoctor;
+
+  nextMemory.pending_reschedule = {
+    appointment_request_id: activeAppointment?.id || pending?.appointment_request_id || null,
+    preferred_date: preferredDate ? toBookingIsoDate(preferredDate) : null,
+    preferred_time: preferredTime || null,
+    preferred_doctor: preferredDoctor || null,
+    status: preferredDate && preferredTime ? "awaiting_confirmation" : "collecting_datetime"
+  };
+
+  return normalizeBookingMemory(nextMemory);
+}
+
+function buildRescheduleDateTimeRequestReply({ memory = {}, payload = {}, messageText = "" } = {}) {
+  const casual = isCasualMessage(messageText);
+  const prefix = getSafePatientPrefix(memory, payload);
+  const hasDate = Boolean(normalizeAppointmentDate(memory.preferred_date));
+  const hasTime = Boolean(normalizeAppointmentTime(memory.preferred_time));
+
+  if (hasDate && !hasTime) {
+    return casual
+      ? `${prefix}день понял. Во сколько перенести?`
+      : `${prefix}день поняла. Напишите, пожалуйста, удобное время для переноса.`;
+  }
+
+  if (!hasDate && hasTime) {
+    return casual
+      ? `${prefix}время понял. На какой день перенести?`
+      : `${prefix}время поняла. Напишите, пожалуйста, на какой день перенести запись.`;
+  }
+
+  return casual
+    ? `${prefix}ок, напишите новый день и время, я проверю.`
+    : `${prefix}поняла, перенесем запись. Напишите новый удобный день и время, я проверю вариант.`;
+}
+
+export function buildRescheduleConfirmationReply({ memory = {}, payload = {}, messageText = "" } = {}) {
+  const casual = isCasualMessage(messageText);
+  const prefix = getSafePatientPrefix(memory, payload);
+  const date = formatReplyDate(formatBookingDateForReply(memory.preferred_date), casual);
+  const time = normalizeAppointmentTime(memory.preferred_time);
+  const doctor = memory.preferred_doctor ? ` к ${formatDoctorForReply(memory.preferred_doctor)}` : "";
+
+  return casual
+    ? `${prefix}могу перенести на ${date} в ${time}${doctor}. Подтверждаете?`
+    : `${prefix}могу перенести запись на ${date} в ${time}${doctor}. Подтверждаете перенос?`;
+}
+
+export function buildRescheduleConfirmedReply({ appointmentRequest = {}, memory = {}, payload = {}, messageText = "" } = {}) {
+  const casual = isCasualMessage(messageText);
+  const prefix = getSafePatientPrefix(memory, payload, appointmentRequest.patientName);
+  const date = formatReplyDate(formatBookingDateForReply(memory.preferred_date || appointmentRequest.preferredDate), casual);
+  const time = normalizeAppointmentTime(memory.preferred_time || appointmentRequest.preferredTime);
+  const doctor = memory.preferred_doctor || appointmentRequest.preferredDoctor;
+  const doctorText = doctor ? ` к ${formatDoctorForReply(doctor)}` : "";
+
+  return casual
+    ? `${prefix}готово, перенесла запись на ${date} в ${time}${doctorText}. Напоминание обновила.`
+    : `${prefix}готово, запись перенесена на ${date} в ${time}${doctorText}. Напоминание перед визитом обновила.`;
+}
+
+function buildRescheduleOutsideWorkingHoursReply({ validation = {}, memory = {}, messageText = "" } = {}) {
+  const casual = isCasualMessage(messageText);
+  const date = validation.date ? formatBookingDateForReply(validation.date) : formatBookingDateForReply(memory.preferred_date);
+  const time = validation.time || memory.preferred_time || "";
+
+  if (validation.reason === "clinic_closed") {
+    return casual
+      ? "В этот день клиника не работает. Киньте другой день и время, проверю."
+      : "В выбранный день клиника не работает. Напишите, пожалуйста, другой день и удобное время для переноса.";
+  }
+
+  const windowText = validation.open && validation.close
+    ? `Рабочее время в этот день: ${validation.open}-${validation.close}.`
+    : "Запись доступна в рабочее время клиники.";
+
+  return casual
+    ? `${time ? `На ${time}` : "На это время"} перенести не получится, это вне рабочего времени. ${windowText} Напишите другое время.`
+    : `${date && time ? `На ${date} в ${time}` : "На выбранное время"} перенести запись не получится: это вне рабочего времени клиники. ${windowText} Подскажите другое удобное время.`;
+}
+
+function buildRescheduleConfirmedMemory({ memory = {}, appointmentRequest = null } = {}) {
+  const nextMemory = {
+    ...memory,
+    status: "appointment_booked",
+    consent_to_book: true
+  };
+  delete nextMemory.pending_reschedule;
+
+  const preferredDate = normalizeAppointmentDate(memory.preferred_date || appointmentRequest?.preferredDate);
+  const preferredTime = normalizeAppointmentTime(memory.preferred_time || appointmentRequest?.preferredTime);
+  const preferredDoctor = memory.preferred_doctor || appointmentRequest?.preferredDoctor || null;
+
+  if (preferredDate) nextMemory.preferred_date = toBookingIsoDate(preferredDate);
+  if (preferredTime) nextMemory.preferred_time = preferredTime;
+  if (preferredDoctor) nextMemory.preferred_doctor = preferredDoctor;
+  if (appointmentRequest?.requestedService && !nextMemory.requested_service) nextMemory.requested_service = appointmentRequest.requestedService;
+  if (appointmentRequest?.complaint && !nextMemory.complaint) nextMemory.complaint = appointmentRequest.complaint;
+
+  nextMemory.booking_state = mergeBookingState(nextMemory.booking_state, {
+    intent: "book_appointment",
+    service: nextMemory.requested_service || appointmentRequest?.requestedService || null,
+    complaint: nextMemory.complaint || appointmentRequest?.complaint || null,
+    doctor: preferredDoctor,
+    date: preferredDate ? toBookingIsoDate(preferredDate) : null,
+    time: preferredTime,
+    patient_name: nextMemory.patient_name || appointmentRequest?.patientName || null,
+    phone: normalizeAppointmentPhone(nextMemory.phone) || normalizeAppointmentPhone(appointmentRequest?.phone),
+    status: "confirmed",
+    missing_fields: []
+  });
+
+  return normalizeBookingMemory(nextMemory);
+}
+
+function buildRescheduleRetryMemory({ memory = {}, clearDate = false, clearTime = true } = {}) {
+  const nextMemory = {
+    ...memory,
+    status: "reschedule_requested",
+    consent_to_book: false
+  };
+  if (clearDate) delete nextMemory.preferred_date;
+  if (clearTime) delete nextMemory.preferred_time;
+  nextMemory.pending_reschedule = {
+    ...(getPendingReschedule(memory) || {}),
+    preferred_date: clearDate ? null : (memory.preferred_date || null),
+    preferred_time: clearTime ? null : (memory.preferred_time || null),
+    preferred_doctor: memory.preferred_doctor || getPendingReschedule(memory)?.preferred_doctor || null,
+    status: "collecting_datetime"
+  };
+  return normalizeBookingMemory(nextMemory);
+}
+
+async function persistRescheduleFlowTurn({
+  contact,
+  conversation,
+  incomingMessage,
+  externalMessageId,
+  payload,
+  messageText,
+  nextMemory,
+  safeReply,
+  pipelineEvents = [],
+  actionType = "reschedule_appointment",
+  replySource = "reschedule_flow",
+  appointmentRequest = null,
+  slotConflict = null,
+  workingHoursValidation = null
+}) {
+  await promoteContactIdentity({ contact, memory: nextMemory, payload });
+
+  const recentMessages = await prisma.message.findMany({
+    where: {
+      conversationId: conversation.id,
+      id: { not: incomingMessage.id }
+    },
+    orderBy: { createdAt: "desc" },
+    take: 8
+  });
+  let finalReply = sanitizeReplyForUser(safeReply, { userMessage: messageText });
+  finalReply = stripUnsafeDoctorAddressing(finalReply, { memory: nextMemory, payload });
+  finalReply = avoidRepeatedBotReply(finalReply, recentMessages);
+
+  const recentOutgoingMessage = await prisma.message.findFirst({
+    where: {
+      conversationId: conversation.id,
+      direction: "outgoing",
+      createdAt: { gte: new Date(Date.now() - RESPONSE_DEBOUNCE_MS) }
+    },
+    orderBy: { createdAt: "desc" }
+  });
+
+  if (
+    recentOutgoingMessage &&
+    normalizeComparableMessage(recentOutgoingMessage.text) === normalizeComparableMessage(finalReply)
+  ) {
+    return buildSkippedResponse({
+      reason: "duplicate_recent_outgoing_reply",
+      contact,
+      conversation,
+      incomingMessage,
+      externalMessageId
+    });
+  }
+
+  const outgoingMessage = await prisma.message.create({
+    data: {
+      conversationId: conversation.id,
+      contactId: contact.id,
+      direction: "outgoing",
+      role: "assistant",
+      text: finalReply,
+      rawPayload: {
+        reply: finalReply,
+        safe_reply: safeReply,
+        action: actionType,
+        state: nextMemory.status,
+        pipeline_events: pipelineEvents,
+        working_hours_validation: workingHoursValidation,
+        slot_conflict: slotConflict,
+        reply_source: replySource
+      }
+    }
+  });
+
+  await prisma.conversationMemory.upsert({
+    where: { conversationId: conversation.id },
+    update: {
+      memory: nextMemory,
+      updatedAt: new Date()
+    },
+    create: {
+      conversationId: conversation.id,
+      memory: nextMemory
+    }
+  });
+
+  await prisma.agentAction.create({
+    data: {
+      conversationId: conversation.id,
+      actionType,
+      reason: replySource,
+      payload: {
+        state: nextMemory.status,
+        safe_reply: safeReply,
+        reply: finalReply,
+        pipeline_events: pipelineEvents,
+        working_hours_validation: workingHoursValidation,
+        slot_conflict: slotConflict
+      }
+    }
+  });
+
+  await logPipelineEvents({ conversationId: conversation.id, events: pipelineEvents });
+
+  return {
+    reply: finalReply,
+    intent: "reschedule",
+    action: actionType,
+    urgency: "low",
+    should_handoff: false,
+    should_create_appointment_request: Boolean(appointmentRequest && !slotConflict),
+    slot_conflict: slotConflict,
+    missing_booking_fields: [],
+    contact_id: contact.id,
+    conversation_id: conversation.id,
+    incoming_message_id: incomingMessage.id,
+    outgoing_message_id: outgoingMessage.id,
+    appointment_request_id: appointmentRequest?.id || null,
+    memory: nextMemory
+  };
+}
+
+async function handleRescheduleFlow({
+  contact,
+  conversation,
+  incomingMessage,
+  externalMessageId,
+  payload,
+  messageText,
+  baseMemory = {},
+  activeAppointment = null,
+  guard = {},
+  deterministicFacts = {}
+}) {
+  if (!isRescheduleFlowRequested({ guard, memory: baseMemory, activeAppointment, facts: deterministicFacts, messageText })) {
+    return null;
+  }
+
+  const pipelineEvents = [
+    ...(guard.events || []),
+    {
+      type: "reschedule_flow_started",
+      guard_intent: guard.intent || null,
+      appointment_request_id: activeAppointment?.id || null
+    }
+  ];
+  const pending = getPendingReschedule(baseMemory);
+  const hasNegativeConfirmation = pending && isNegativeRescheduleConfirmation(messageText);
+  let nextMemory = buildRescheduleCandidateMemory({
+    baseMemory,
+    activeAppointment,
+    deterministicFacts,
+    payload,
+    keepCandidate: !hasNegativeConfirmation
+  });
+
+  if (hasNegativeConfirmation) {
+    pipelineEvents.push({ type: "reschedule_candidate_rejected" });
+    const safeReply = buildRescheduleDateTimeRequestReply({ memory: nextMemory, payload, messageText });
+    return await persistRescheduleFlowTurn({
+      contact,
+      conversation,
+      incomingMessage,
+      externalMessageId,
+      payload,
+      messageText,
+      nextMemory,
+      safeReply,
+      pipelineEvents,
+      actionType: "collect_datetime",
+      replySource: "reschedule_candidate_rejected"
+    });
+  }
+
+  const hasDate = Boolean(normalizeAppointmentDate(nextMemory.preferred_date));
+  const hasTime = Boolean(normalizeAppointmentTime(nextMemory.preferred_time));
+  if (!hasDate || !hasTime) {
+    pipelineEvents.push({
+      type: "reschedule_missing_datetime",
+      missing_fields: [
+        ...(!hasDate ? ["preferred_date"] : []),
+        ...(!hasTime ? ["preferred_time"] : [])
+      ]
+    });
+    const safeReply = buildRescheduleDateTimeRequestReply({ memory: nextMemory, payload, messageText });
+    return await persistRescheduleFlowTurn({
+      contact,
+      conversation,
+      incomingMessage,
+      externalMessageId,
+      payload,
+      messageText,
+      nextMemory,
+      safeReply,
+      pipelineEvents,
+      actionType: "collect_datetime",
+      replySource: "reschedule_collect_datetime"
+    });
+  }
+
+  const confirmation = deterministicFacts.confirmation === true ||
+    deterministicFacts.consent_to_book === true ||
+    hasExplicitBookingConfirmation(messageText) ||
+    (pending?.status === "awaiting_confirmation" && isBookingConfirmationText(messageText));
+  if (!confirmation) {
+    pipelineEvents.push({
+      type: "reschedule_awaiting_confirmation",
+      preferred_date: nextMemory.preferred_date,
+      preferred_time: nextMemory.preferred_time
+    });
+    const safeReply = buildRescheduleConfirmationReply({ memory: nextMemory, payload, messageText });
+    return await persistRescheduleFlowTurn({
+      contact,
+      conversation,
+      incomingMessage,
+      externalMessageId,
+      payload,
+      messageText,
+      nextMemory,
+      safeReply,
+      pipelineEvents,
+      actionType: "offer_booking",
+      replySource: "reschedule_confirmation_request"
+    });
+  }
+
+  const workingHoursValidation = validateRequestedTimeAgainstWorkingHours({
+    date: nextMemory.preferred_date,
+    time: nextMemory.preferred_time,
+    clinicConfig: config
+  });
+  pipelineEvents.push(...(workingHoursValidation.events || []));
+  if (workingHoursValidation.valid === false) {
+    nextMemory = buildRescheduleRetryMemory({
+      memory: nextMemory,
+      clearDate: workingHoursValidation.reason === "clinic_closed",
+      clearTime: true
+    });
+    const safeReply = buildRescheduleOutsideWorkingHoursReply({ validation: workingHoursValidation, memory: nextMemory, messageText });
+    return await persistRescheduleFlowTurn({
+      contact,
+      conversation,
+      incomingMessage,
+      externalMessageId,
+      payload,
+      messageText,
+      nextMemory,
+      safeReply,
+      pipelineEvents,
+      actionType: "collect_datetime",
+      replySource: "reschedule_outside_working_hours",
+      workingHoursValidation
+    });
+  }
+
+  nextMemory.consent_to_book = true;
+  const bookingResult = await upsertAppointmentRequest({
+    conversationId: conversation.id,
+    contactId: contact.id,
+    payload,
+    memory: nextMemory,
+    confirm: true,
+    missingFields: []
+  });
+  const { appointmentRequest, slotConflict } = bookingResult;
+
+  if (slotConflict) {
+    pipelineEvents.push({
+      type: "reschedule_slot_conflict",
+      preferred_date: slotConflict.preferred_date,
+      preferred_time: slotConflict.preferred_time
+    });
+    nextMemory = buildRescheduleRetryMemory({ memory: nextMemory, clearTime: true });
+    const safeReply = buildSlotConflictReply({ memory: nextMemory, slotConflict, messageText });
+    return await persistRescheduleFlowTurn({
+      contact,
+      conversation,
+      incomingMessage,
+      externalMessageId,
+      payload,
+      messageText,
+      nextMemory,
+      safeReply,
+      pipelineEvents,
+      actionType: "collect_datetime",
+      replySource: "reschedule_slot_conflict",
+      slotConflict,
+      workingHoursValidation
+    });
+  }
+
+  nextMemory = buildRescheduleConfirmedMemory({ memory: nextMemory, appointmentRequest });
+  pipelineEvents.push({
+    type: "reschedule_confirmed",
+    appointment_request_id: appointmentRequest?.id || null,
+    preferred_date: nextMemory.preferred_date,
+    preferred_time: nextMemory.preferred_time
+  });
+  const safeReply = buildRescheduleConfirmedReply({ appointmentRequest, memory: nextMemory, payload, messageText });
+  return await persistRescheduleFlowTurn({
+    contact,
+    conversation,
+    incomingMessage,
+    externalMessageId,
+    payload,
+    messageText,
+    nextMemory,
+    safeReply,
+    pipelineEvents,
+    actionType: "reschedule_appointment",
+    replySource: "reschedule_confirmed",
+    appointmentRequest,
+    workingHoursValidation
+  });
+}
+
 async function handleGuardedScriptedTurn({
   contact,
   conversation,
@@ -1560,6 +2143,8 @@ async function handleGuardedScriptedTurn({
     actionType = "none";
     pipelineEvents.push({ type: "noise_ignored_without_state_change", previous_status: nextMemory.status || null });
   }
+
+  await promoteContactIdentity({ contact, memory: nextMemory, payload });
 
   const safeReply = buildSafeScriptedReply({
     intent: guard.intent,
@@ -3122,6 +3707,15 @@ function isInformationQuestion(text = "") {
   const lower = String(text || "").toLowerCase();
   return /(по\s+бабк|как\s+по\s+бабк|как\s+по\s+деньг|по\s+деньгам|(?:^|\s)деньги(?:\s|$)|сколько|скок|скока|цена|стоимост|стоить|стоит|прайс|ценник|какие\s+врачи|какой\s+врач|кто\s+врач|когда\s+можно|есть\s+ли\s+врач|консультаци|при[её]м\s+сколько|можно\s+приехать)/iu.test(lower) &&
     !/(запишите|хочу\s+записа|давайте\s+запиш|подходит,\s*запиш|оформите\s+запись)/iu.test(lower);
+}
+
+// Похоже ли сообщение на вопрос клиента (шире, чем isInformationQuestion).
+// Нужно, чтобы после записи не затирать ответ модели шаблонной соц-репликой.
+function looksLikeUserQuestion(text = "") {
+  const lower = String(text || "").toLowerCase();
+  if (isInformationQuestion(lower)) return true;
+  if (/\?/.test(text)) return true;
+  return /(?:^|\s)(?:где|куда|адрес|парковк|во\s*сколько|во\s*скок|доехать|добраться|проехать|как\s+(?:найти|пройти|вас)|нужно\s+ли|надо\s+ли|можно\s+ли|а\s+можно)(?:\s|$|\?)/iu.test(lower);
 }
 
 async function logPipelineEvents({ conversationId, events = [] }) {

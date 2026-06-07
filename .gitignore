@@ -1,6 +1,7 @@
 .env
 node_modules/
 *.log
+*.zip
 ~$*.xlsx
 
 max-adapter/.auth/
