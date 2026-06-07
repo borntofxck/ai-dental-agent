@@ -52,8 +52,8 @@ module.exports = {
       error_file: "logs/pm2-max-adapter.err.log",
       env: {
         MAX_ADAPTER_PORT: "3001",
-        MAX_OPEN_BROWSER: "false",
-        MAX_HEADLESS: "false",
+        MAX_OPEN_BROWSER: "true",
+        MAX_HEADLESS: "true",
         AGENT_API_URL: "http://localhost:3002",
         N8N_WEBHOOK_URL: "http://localhost:5678/webhook/incoming-message"
       }
