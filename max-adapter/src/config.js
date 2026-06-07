@@ -35,6 +35,8 @@ export const config = {
   reminderPollIntervalMs: Number(process.env.REMINDER_POLL_INTERVAL_MS || 60000),
   openBrowser: process.env.MAX_OPEN_BROWSER !== "false",
   headless: process.env.MAX_HEADLESS === "true",
+  autoStartWatcher: process.env.MAX_AUTO_START_WATCHER === "true",
+  autoStartReminderWatcher: process.env.REMINDER_AUTO_START_WATCHER === "true",
   userDataDir,
   artifactsDir,
   selectors: {

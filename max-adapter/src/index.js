@@ -64,6 +64,24 @@ function buildAgentApiHeaders(extraHeaders = {}) {
   };
 }
 
+function startWatcherTimers(mode = "all") {
+  watcher.mode = mode === "active" ? "active" : "all";
+  if (watcher.scannerTimer) return;
+
+  watcher.running = true;
+  watcher.startedAt = new Date();
+  watcher.scannerTimer = setInterval(runScannerTick, watcher.intervalMs);
+  watcher.workerTimer = setInterval(runQueueWorkerTick, watcher.workerIntervalMs);
+}
+
+function startReminderWatcherTimer() {
+  if (reminderWatcher.timer) return;
+
+  reminderWatcher.running = true;
+  reminderWatcher.startedAt = new Date();
+  reminderWatcher.timer = setInterval(runReminderWatcherTick, reminderWatcher.intervalMs);
+}
+
 app.get("/health", (req, res) => {
   res.json({ ok: true, service: "max-adapter" });
 });
@@ -190,8 +208,6 @@ app.get("/max/watch/status", (req, res) => {
 
 app.post("/max/watch/start", async (req, res) => {
   try {
-    watcher.mode = req.body.mode === "active" ? "active" : "all";
-
     if (req.body.interval_ms) {
       watcher.intervalMs = Math.max(2000, Number(req.body.interval_ms));
     }
@@ -200,12 +216,7 @@ app.post("/max/watch/start", async (req, res) => {
       watcher.workerIntervalMs = Math.max(500, Number(req.body.worker_interval_ms));
     }
 
-    if (!watcher.scannerTimer) {
-      watcher.running = true;
-      watcher.startedAt = new Date();
-      watcher.scannerTimer = setInterval(runScannerTick, watcher.intervalMs);
-      watcher.workerTimer = setInterval(runQueueWorkerTick, watcher.workerIntervalMs);
-    }
+    startWatcherTimers(req.body.mode);
 
     const firstScan = await runScannerTick({ force: Boolean(req.body.force) });
     const firstWorker = await runQueueWorkerTick();
@@ -306,11 +317,7 @@ app.post("/reminders/watch/start", async (req, res) => {
       reminderWatcher.intervalMs = Math.max(10000, Number(req.body.interval_ms));
     }
 
-    if (!reminderWatcher.timer) {
-      reminderWatcher.running = true;
-      reminderWatcher.startedAt = new Date();
-      reminderWatcher.timer = setInterval(runReminderWatcherTick, reminderWatcher.intervalMs);
-    }
+    startReminderWatcherTimer();
 
     const firstRun = await runReminderWatcherTick();
     res.json({ ...getReminderWatcherStatus(), first_run: firstRun });
@@ -341,6 +348,26 @@ app.listen(config.port, async () => {
     await maxClient.start();
   } else {
     console.log("MAX browser startup skipped because MAX_OPEN_BROWSER=false");
+  }
+
+  if (config.autoStartWatcher) {
+    startWatcherTimers("all");
+    runScannerTick().catch((error) => {
+      watcher.lastError = error.message;
+      console.error("MAX watcher auto-start scan failed:", error);
+    });
+    runQueueWorkerTick().catch((error) => {
+      watcher.lastError = error.message;
+      console.error("MAX watcher auto-start worker failed:", error);
+    });
+  }
+
+  if (config.autoStartReminderWatcher) {
+    startReminderWatcherTimer();
+    runReminderWatcherTick().catch((error) => {
+      reminderWatcher.lastError = error.message;
+      console.error("Reminder watcher auto-start failed:", error);
+    });
   }
 });
 

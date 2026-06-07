@@ -54,6 +54,8 @@ module.exports = {
         MAX_ADAPTER_PORT: "3001",
         MAX_OPEN_BROWSER: "true",
         MAX_HEADLESS: "true",
+        MAX_AUTO_START_WATCHER: "true",
+        REMINDER_AUTO_START_WATCHER: "true",
         AGENT_API_URL: "http://localhost:3002",
         N8N_WEBHOOK_URL: "http://localhost:5678/webhook/incoming-message"
       }
