@@ -1,6 +1,7 @@
 .env
 node_modules/
 *.log
+~$*.xlsx
 
 max-adapter/.auth/
 max-adapter/artifacts/
